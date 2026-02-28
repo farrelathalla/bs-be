@@ -13,7 +13,7 @@ import (
 	"bs-be/models"
 )
 
-// RequiredColumns defines the expected CSV columns in order
+// RequiredColumns defines the minimum required CSV columns
 var RequiredColumns = []string{
 	"Reporting Date",
 	"Account ID",
@@ -30,8 +30,59 @@ var RequiredColumns = []string{
 	"Insured/Uninsured",
 	"Transactional/Non Transactional",
 	"Method",
+}
+
+// OptionalColumns have defaults when missing
+var OptionalColumns = []string{
 	"Interest Payment Frequency",
 	"Day Count",
+}
+
+// columnAliases maps alternative header names to canonical names
+var columnAliases = map[string]string{
+	"accountid":            "Account ID",
+	"account_id":           "Account ID",
+	"account id":           "Account ID",
+	"installment":          "Installment Frequency",
+	"installment frequency":"Installment Frequency",
+	"installmentfrequency": "Installment Frequency",
+	"product type":         "ProductType",
+	"producttype":          "ProductType",
+	"product_type":         "ProductType",
+	"interest payment frequency": "Interest Payment Frequency",
+	"interestpaymentfrequency":   "Interest Payment Frequency",
+	"day count":            "Day Count",
+	"daycount":             "Day Count",
+	"day_count":            "Day Count",
+	"reporting date":       "Reporting Date",
+	"reportingdate":        "Reporting Date",
+	"ccy":                  "CCY",
+	"currency":             "CCY",
+	"outstanding":          "Outstanding",
+	"interest rate":        "Interest Rate",
+	"interestrate":         "Interest Rate",
+	"start date":           "Start Date",
+	"startdate":            "Start Date",
+	"end date":             "End Date",
+	"enddate":              "End Date",
+	"segment":              "Segment",
+	"daerah":               "Daerah",
+	"kodepos":              "KodePos",
+	"kode pos":             "KodePos",
+	"kode_pos":             "KodePos",
+	"insured/uninsured":    "Insured/Uninsured",
+	"transactional/non transactional": "Transactional/Non Transactional",
+	"method":               "Method",
+}
+
+// normalizeHeader maps a raw header to its canonical name
+func normalizeHeader(raw string) string {
+	lower := strings.ToLower(strings.TrimSpace(raw))
+	if canonical, ok := columnAliases[lower]; ok {
+		return canonical
+	}
+	// Return original trimmed value if no alias found
+	return strings.TrimSpace(raw)
 }
 
 // ValidateAndParseCSV validates a CSV file and returns parsed loans or validation errors.
@@ -70,13 +121,12 @@ func ValidateAndParseCSV(reader io.Reader, maxErrors int) ([]models.Loan, []mode
 		errors = append(errors, models.ValidationError{Row: 0, Column: "", Message: "Failed to read header row: " + err.Error()})
 		return nil, errors
 	}
-
-	// Trim headers
+	// Trim and normalize headers to canonical names
 	for i := range header {
-		header[i] = strings.TrimSpace(header[i])
+		header[i] = normalizeHeader(header[i])
 	}
 
-	// Build column index map
+	// Build column index map using canonical names
 	colIndex := make(map[string]int)
 	for i, h := range header {
 		colIndex[h] = i
@@ -92,6 +142,7 @@ func ValidateAndParseCSV(reader io.Reader, maxErrors int) ([]models.Loan, []mode
 			})
 		}
 	}
+	// Optional columns are NOT checked — they get defaults in parseRow
 
 	if len(errors) > 0 {
 		return nil, errors
@@ -204,11 +255,19 @@ func parseRow(record []string, colIndex map[string]int, rowNum int) (*models.Loa
 			Message: fmt.Sprintf("Invalid date format '%s', expected DD/MM/YYYY", getField("End Date")),
 		})
 	}
-
 	// Installment Frequency (nullable)
+	// Accepts: numeric (e.g. 1, 3, 12), "Yes"/"No", or empty/NULL
 	var installmentFreq *int
 	instFreqStr := getField("Installment Frequency")
-	if instFreqStr != "" && strings.ToUpper(instFreqStr) != "NULL" {
+	upperInstFreq := strings.ToUpper(instFreqStr)
+	if upperInstFreq == "YES" {
+		// "Yes" means installment exists; default to monthly (1)
+		v := 1
+		installmentFreq = &v
+	} else if upperInstFreq == "NO" || upperInstFreq == "NULL" || instFreqStr == "" {
+		// No installment
+		installmentFreq = nil
+	} else {
 		v, err := strconv.Atoi(instFreqStr)
 		if err != nil {
 			// Try parsing as float first
@@ -216,7 +275,7 @@ func parseRow(record []string, colIndex map[string]int, rowNum int) (*models.Loa
 			if ferr != nil || math.IsNaN(fv) {
 				errors = append(errors, models.ValidationError{
 					Row: rowNum, Column: "Installment Frequency",
-					Message: fmt.Sprintf("'%s' is not a valid integer", instFreqStr),
+					Message: fmt.Sprintf("'%s' is not a valid value (expected number, 'Yes', or 'No')", instFreqStr),
 				})
 			} else {
 				iv := int(fv)
@@ -370,15 +429,14 @@ func detectDelimiter(text string) rune {
 			}
 		}
 	}
-
-	// Need at least 16 delimiters for 17 columns
-	if tabCount >= 16 {
+	// Need at least 14 delimiters for 15+ columns
+	if tabCount >= 14 {
 		return '\t'
 	}
-	if semiCount >= 16 {
+	if semiCount >= 14 {
 		return ';'
 	}
-	if commaCount >= 16 {
+	if commaCount >= 14 {
 		return ','
 	}
 
