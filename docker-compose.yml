@@ -13,11 +13,10 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
-
   api:
     build: .
-    ports:
-      - "8002:8002"
+    expose:
+      - "8002"
     environment:
       DB_HOST: db
       DB_PORT: "5432"
@@ -33,6 +32,20 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "8002:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx/entrypoint.sh:/entrypoint.sh:ro
+      - certs:/etc/nginx/certs
+    entrypoint: ["/bin/sh", "/entrypoint.sh"]
+    depends_on:
+      - api
+    restart: unless-stopped
+
 volumes:
   pgdata:
   uploads:
+  certs:
