@@ -1,0 +1,2 @@
+-- Seed is handled by Go application on startup
+-- See config/seed.go
