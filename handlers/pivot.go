@@ -39,6 +39,7 @@ func GetPivot(c *gin.Context) {
 		"account_id":             "li.account_id",
 		"reporting_date":         "li.reporting_date::text",
 		"day_count":              "li.day_count",
+		"installment_frequency":  "li.installment_frequency::text",
 	}
 
 	var selectCols []string
@@ -268,33 +269,33 @@ func buildAggregates(irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI map[string]float64
 	switch filterType {
 	case "bbi":
 		for k, v := range irrbbP {
-			result["irrbb_"+k] = calculator.Round2(v)
+			result["irrbb__"+k] = calculator.Round2(v)
 		}
 		for k, v := range lcrP {
-			result["lcr_"+k] = calculator.Round2(v)
+			result["lcr__"+k] = calculator.Round2(v)
 		}
 		for k, v := range nsfrP {
-			result["nsfr_"+k] = calculator.Round2(v)
+			result["nsfr__"+k] = calculator.Round2(v)
 		}
 	case "interest":
 		for k, v := range irrbbI {
-			result["irrbb_"+k] = calculator.Round2(v)
+			result["irrbb__"+k] = calculator.Round2(v)
 		}
 		for k, v := range lcrI {
-			result["lcr_"+k] = calculator.Round2(v)
+			result["lcr__"+k] = calculator.Round2(v)
 		}
 		for k, v := range nsfrI {
-			result["nsfr_"+k] = calculator.Round2(v)
+			result["nsfr__"+k] = calculator.Round2(v)
 		}
 	default: // both
 		for k, v := range irrbbP {
-			result["irrbb_"+k] = calculator.Round2(v + irrbbI[k])
+			result["irrbb__"+k] = calculator.Round2(v + irrbbI[k])
 		}
 		for k, v := range lcrP {
-			result["lcr_"+k] = calculator.Round2(v + lcrI[k])
+			result["lcr__"+k] = calculator.Round2(v + lcrI[k])
 		}
 		for k, v := range nsfrP {
-			result["nsfr_"+k] = calculator.Round2(v + nsfrI[k])
+			result["nsfr__"+k] = calculator.Round2(v + nsfrI[k])
 		}
 	}
 
@@ -305,17 +306,24 @@ func buildAggregates(irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI map[string]float64
 func GetFilterOptions(c *gin.Context) {
 	uploadID := c.Param("id")
 	column := c.Query("column")
-
 	validCols := map[string]string{
-		"ccy":                    "ccy",
-		"segment":                "segment",
-		"product_type":           "product_type",
-		"daerah":                 "daerah",
-		"method":                 "method",
-		"insured_or_uninsured":   "insured_or_uninsured",
-		"transactional_or_non":   "transactional_or_non",
-		"kode_pos":               "kode_pos",
-		"day_count":              "day_count",
+		"ccy":                          "ccy",
+		"segment":                      "segment",
+		"product_type":                 "product_type",
+		"daerah":                       "daerah",
+		"method":                       "method",
+		"insured_or_uninsured":         "insured_or_uninsured",
+		"transactional_or_non":         "transactional_or_non",
+		"kode_pos":                     "kode_pos",
+		"day_count":                    "day_count",
+		"reporting_date":               "reporting_date::text",
+		"account_id":                   "account_id",
+		"start_date":                   "start_date::text",
+		"end_date":                     "end_date::text",
+		"outstanding":                  "outstanding::text",
+		"interest_rate":                "interest_rate::text",
+		"installment_frequency":        "installment_frequency::text",
+		"interest_payment_frequency":   "interest_payment_frequency::text",
 	}
 
 	dbCol, ok := validCols[column]
