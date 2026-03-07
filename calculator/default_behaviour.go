@@ -97,6 +97,7 @@ func ComputeBehaviourBuckets(outstanding float64, weights BehaviourWeights) (
 }
 
 // GetMatchingBehaviours returns behaviour IDs and names that match a loan's criteria for a given upload
+// Empty mapping fields act as wildcards (match any value)
 func GetMatchingBehaviours(uploadID, productType, ccy, segment, transactional string) []struct {
 	BehaviourID   int64
 	BehaviourName string
@@ -106,10 +107,10 @@ func GetMatchingBehaviours(uploadID, productType, ccy, segment, transactional st
 		 FROM scenario_mappings sm
 		 JOIN behaviours b ON b.id = sm.behaviour_id
 		 WHERE sm.upload_id = $1
-		   AND sm.product_type = $2
-		   AND sm.ccy = $3
-		   AND sm.segment = $4
-		   AND sm.transactional = $5`,
+		   AND (sm.product_type = '' OR sm.product_type = $2)
+		   AND (sm.ccy = '' OR sm.ccy = $3)
+		   AND (sm.segment = '' OR sm.segment = $4)
+		   AND (sm.transactional = '' OR sm.transactional = $5)`,
 		uploadID, productType, ccy, segment, transactional,
 	)
 	if err != nil {

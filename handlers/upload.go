@@ -21,6 +21,12 @@ import (
 	"github.com/google/uuid"
 )
 
+// loanWithID pairs a loan_input database ID with its parsed Loan data (used for reprocessing)
+type loanWithID struct {
+	InputID int64
+	Loan    models.Loan
+}
+
 func UploadCSV(c *gin.Context) {
 	userID, _ := c.Get("user_id")
 
@@ -260,7 +266,7 @@ func ReprocessUpload(c *gin.Context) {
 	uploadID := c.Param("id")
 	userID, _ := c.Get("user_id")
 
-	// Verify ownership
+	// Verify ownership + check not already processing
 	var status string
 	err := config.DB.QueryRow(
 		"SELECT status FROM uploads WHERE id = $1 AND user_id = $2",
@@ -270,16 +276,17 @@ func ReprocessUpload(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Upload not found"})
 		return
 	}
+	if status == "processing" {
+		c.JSON(http.StatusConflict, gin.H{"error": "Already processing"})
+		return
+	}
 
-	// Delete existing cashflow results
-	config.DB.Exec("DELETE FROM cashflow_results WHERE upload_id = $1", uploadID)
-
-	// Mark as processing
+	// Mark as processing first (prevents concurrent calls)
 	config.DB.Exec("UPDATE uploads SET status = 'processing' WHERE id = $1", uploadID)
 
-	// Re-read loans from DB
+	// Re-read existing loan_inputs WITH their IDs (DO NOT re-insert them)
 	rows, err := config.DB.Query(
-		`SELECT reporting_date, account_id, ccy, outstanding, interest_rate,
+		`SELECT id, reporting_date, account_id, ccy, outstanding, interest_rate,
 		        start_date, end_date, installment_frequency,
 		        product_type, segment, daerah, kode_pos,
 		        insured_or_uninsured, transactional_or_non, method,
@@ -289,24 +296,26 @@ func ReprocessUpload(c *gin.Context) {
 		uploadID,
 	)
 	if err != nil {
+		config.DB.Exec("UPDATE uploads SET status = 'completed' WHERE id = $1", uploadID)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to read loans"})
 		return
 	}
 	defer rows.Close()
 
-	var loans []models.Loan
+	var loanRows []loanWithID
 	for rows.Next() {
-		var loan models.Loan
+		var lw loanWithID
 		var endDate sql.NullTime
 		var installmentFreq, interestPaymentFreq sql.NullInt64
 
 		err := rows.Scan(
-			&loan.ReportingDate, &loan.AccountID, &loan.CCY, &loan.Outstanding,
-			&loan.InterestRate, &loan.StartDate, &endDate, &installmentFreq,
-			&loan.ProductType, &loan.Segment, &loan.Daerah, &loan.KodePos,
-			&loan.InsuredOrUninsured, &loan.TransactionalOrNon, &loan.Method,
-			&interestPaymentFreq, &loan.DayCount,
-			&loan.DefaultBehaviour, &loan.InstrumentType,
+			&lw.InputID,
+			&lw.Loan.ReportingDate, &lw.Loan.AccountID, &lw.Loan.CCY, &lw.Loan.Outstanding,
+			&lw.Loan.InterestRate, &lw.Loan.StartDate, &endDate, &installmentFreq,
+			&lw.Loan.ProductType, &lw.Loan.Segment, &lw.Loan.Daerah, &lw.Loan.KodePos,
+			&lw.Loan.InsuredOrUninsured, &lw.Loan.TransactionalOrNon, &lw.Loan.Method,
+			&interestPaymentFreq, &lw.Loan.DayCount,
+			&lw.Loan.DefaultBehaviour, &lw.Loan.InstrumentType,
 		)
 		if err != nil {
 			log.Printf("Error reading loan: %v", err)
@@ -314,24 +323,176 @@ func ReprocessUpload(c *gin.Context) {
 		}
 
 		if endDate.Valid {
-			loan.EndDate = &endDate.Time
+			lw.Loan.EndDate = &endDate.Time
 		}
 		if installmentFreq.Valid {
 			v := int(installmentFreq.Int64)
-			loan.InstallmentFrequency = &v
+			lw.Loan.InstallmentFrequency = &v
 		}
 		if interestPaymentFreq.Valid {
 			v := int(interestPaymentFreq.Int64)
-			loan.InterestPaymentFrequency = &v
+			lw.Loan.InterestPaymentFrequency = &v
 		}
 
-		loans = append(loans, loan)
+		loanRows = append(loanRows, lw)
 	}
 
-	// Process in background
-	go processLoans(uploadID, loans)
+	// Process in background: delete old results + regenerate (all inside goroutine)
+	go reprocessFromDB(uploadID, loanRows)
 
-	c.JSON(http.StatusOK, gin.H{"message": "Reprocessing started", "total_rows": len(loans)})
+	c.JSON(http.StatusOK, gin.H{"message": "Reprocessing started", "total_rows": len(loanRows)})
+}
+
+// reprocessFromDB deletes old cashflow_results and regenerates from existing loan_inputs
+func reprocessFromDB(uploadID string, loanRows []loanWithID) {
+	// Delete existing results first (inside the goroutine to prevent race condition)
+	_, err := config.DB.Exec("DELETE FROM cashflow_results WHERE upload_id = $1", uploadID)
+	if err != nil {
+		log.Printf("Error deleting old results for %s: %v", uploadID, err)
+		config.DB.Exec("UPDATE uploads SET status = 'failed', error_message = $1 WHERE id = $2",
+			"Failed to clear old results", uploadID)
+		return
+	}
+
+	// Load default behaviour weights
+	defaultBehaviourID := calculator.LoadDefaultBehaviourID()
+	var defaultWeights calculator.BehaviourWeights
+	if defaultBehaviourID > 0 {
+		defaultWeights = calculator.LoadBehaviourWeights(defaultBehaviourID)
+	}
+
+	batchSize := 500
+	for i := 0; i < len(loanRows); i += batchSize {
+		end := i + batchSize
+		if end > len(loanRows) {
+			end = len(loanRows)
+		}
+		batch := loanRows[i:end]
+
+		err := reprocessBatch(uploadID, batch, defaultWeights)
+		if err != nil {
+			log.Printf("Error reprocessing batch starting at %d: %v", i, err)
+			config.DB.Exec(
+				"UPDATE uploads SET status = 'failed', error_message = $1 WHERE id = $2",
+				fmt.Sprintf("Reprocessing error at row %d: %v", i+1, err), uploadID,
+			)
+			return
+		}
+	}
+
+	config.DB.Exec("UPDATE uploads SET status = 'completed' WHERE id = $1", uploadID)
+	log.Printf("Upload %s reprocessed successfully (%d loans)", uploadID, len(loanRows))
+}
+
+// reprocessBatch generates cashflow_results for existing loan_inputs (does NOT re-insert loan_inputs)
+func reprocessBatch(uploadID string, loanRows []loanWithID, defaultWeights calculator.BehaviourWeights) error {
+	tx, err := config.DB.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	for _, lw := range loanRows {
+		loanInputID := lw.InputID
+		loan := lw.Loan
+
+		// ===== RESULT 1: Normal (only if has end date) =====
+		if loan.HasEndDate() {
+			schedule := calculator.GenerateSchedule(&loan)
+			irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI := calculator.ComputeAllBuckets(schedule, loan.ReportingDate)
+
+			remainingDays := loan.TenorDays()
+
+			irrbbPJSON, _ := json.Marshal(irrbbP)
+			irrbbIJSON, _ := json.Marshal(irrbbI)
+			lcrPJSON, _ := json.Marshal(lcrP)
+			lcrIJSON, _ := json.Marshal(lcrI)
+			nsfrPJSON, _ := json.Marshal(nsfrP)
+			nsfrIJSON, _ := json.Marshal(nsfrI)
+
+			_, err = tx.Exec(
+				`INSERT INTO cashflow_results (
+					upload_id, loan_input_id, remaining_days,
+					irrbb_principal, irrbb_interest,
+					lcr_principal, lcr_interest,
+					nsfr_principal, nsfr_interest,
+					result_type
+				) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+				uploadID, loanInputID, remainingDays,
+				irrbbPJSON, irrbbIJSON, lcrPJSON, lcrIJSON, nsfrPJSON, nsfrIJSON,
+				"Normal",
+			)
+			if err != nil {
+				return fmt.Errorf("failed to insert normal result: %w", err)
+			}
+		}
+
+		// ===== RESULT 2: Default Behaviour (always) =====
+		if defaultWeights != nil {
+			irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI := calculator.ComputeBehaviourBuckets(loan.Outstanding, defaultWeights)
+
+			irrbbPJSON, _ := json.Marshal(irrbbP)
+			irrbbIJSON, _ := json.Marshal(irrbbI)
+			lcrPJSON, _ := json.Marshal(lcrP)
+			lcrIJSON, _ := json.Marshal(lcrI)
+			nsfrPJSON, _ := json.Marshal(nsfrP)
+			nsfrIJSON, _ := json.Marshal(nsfrI)
+
+			_, err = tx.Exec(
+				`INSERT INTO cashflow_results (
+					upload_id, loan_input_id, remaining_days,
+					irrbb_principal, irrbb_interest,
+					lcr_principal, lcr_interest,
+					nsfr_principal, nsfr_interest,
+					result_type
+				) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+				uploadID, loanInputID, 0,
+				irrbbPJSON, irrbbIJSON, lcrPJSON, lcrIJSON, nsfrPJSON, nsfrIJSON,
+				"Default Behaviour",
+			)
+			if err != nil {
+				return fmt.Errorf("failed to insert default behaviour result: %w", err)
+			}
+		}
+
+		// ===== RESULT 3+: Custom Behaviours (from scenario mappings) =====
+		matchingBehaviours := calculator.GetMatchingBehaviours(
+			uploadID, loan.ProductType, loan.CCY, loan.Segment, loan.TransactionalOrNon,
+		)
+		for _, mb := range matchingBehaviours {
+			weights := calculator.LoadBehaviourWeights(mb.BehaviourID)
+			if weights == nil {
+				continue
+			}
+
+			irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI := calculator.ComputeBehaviourBuckets(loan.Outstanding, weights)
+
+			irrbbPJSON, _ := json.Marshal(irrbbP)
+			irrbbIJSON, _ := json.Marshal(irrbbI)
+			lcrPJSON, _ := json.Marshal(lcrP)
+			lcrIJSON, _ := json.Marshal(lcrI)
+			nsfrPJSON, _ := json.Marshal(nsfrP)
+			nsfrIJSON, _ := json.Marshal(nsfrI)
+
+			_, err = tx.Exec(
+				`INSERT INTO cashflow_results (
+					upload_id, loan_input_id, remaining_days,
+					irrbb_principal, irrbb_interest,
+					lcr_principal, lcr_interest,
+					nsfr_principal, nsfr_interest,
+					result_type
+				) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+				uploadID, loanInputID, 0,
+				irrbbPJSON, irrbbIJSON, lcrPJSON, lcrIJSON, nsfrPJSON, nsfrIJSON,
+				mb.BehaviourName,
+			)
+			if err != nil {
+				return fmt.Errorf("failed to insert custom behaviour result: %w", err)
+			}
+		}
+	}
+
+	return tx.Commit()
 }
 
 func GetUploadStatus(c *gin.Context) {
