@@ -21,6 +21,7 @@ type LoginResponse struct {
 	Token    string `json:"token"`
 	Username string `json:"username"`
 	UserID   string `json:"user_id"`
+	Role     string `json:"role"`
 }
 
 func Login(c *gin.Context) {
@@ -30,11 +31,11 @@ func Login(c *gin.Context) {
 		return
 	}
 
-	var userID, passwordHash string
+	var userID, passwordHash, role string
 	err := config.DB.QueryRow(
-		"SELECT id, password_hash FROM users WHERE username = $1",
+		"SELECT id, password_hash, COALESCE(role, 'user') FROM users WHERE username = $1",
 		req.Username,
-	).Scan(&userID, &passwordHash)
+	).Scan(&userID, &passwordHash, &role)
 
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid username or password"})
@@ -65,6 +66,7 @@ func Login(c *gin.Context) {
 		Token:    token,
 		Username: req.Username,
 		UserID:   userID,
+		Role:     role,
 	})
 }
 
@@ -86,9 +88,11 @@ func Logout(c *gin.Context) {
 func CheckAuth(c *gin.Context) {
 	userID, _ := c.Get("user_id")
 	username, _ := c.Get("username")
+	role, _ := c.Get("role")
 	c.JSON(http.StatusOK, gin.H{
 		"user_id":  userID,
 		"username": username,
+		"role":     role,
 	})
 }
 

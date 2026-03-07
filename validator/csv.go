@@ -20,22 +20,24 @@ var RequiredColumns = []string{
 	"CCY",
 	"Outstanding",
 	"Interest Rate",
-	"Start Date",
 	"End Date",
 	"Installment Frequency",
+	"Method",
+	"Interest Payment Frequency",
+	"Day Count",
+}
+
+// OptionalColumns have defaults when missing
+var OptionalColumns = []string{
+	"Start Date",
 	"ProductType",
 	"Segment",
 	"Daerah",
 	"KodePos",
 	"Insured/Uninsured",
 	"Transactional/Non Transactional",
-	"Method",
-}
-
-// OptionalColumns have defaults when missing
-var OptionalColumns = []string{
-	"Interest Payment Frequency",
-	"Day Count",
+	"Default Behaviour",
+	"Instrument Type",
 }
 
 // columnAliases maps alternative header names to canonical names
@@ -73,6 +75,25 @@ var columnAliases = map[string]string{
 	"insured/uninsured":    "Insured/Uninsured",
 	"transactional/non transactional": "Transactional/Non Transactional",
 	"method":               "Method",
+	"default behaviour":    "Default Behaviour",
+	"defaultbehaviour":     "Default Behaviour",
+	"default_behaviour":    "Default Behaviour",
+	"instrument type":      "Instrument Type",
+	"instrumenttype":       "Instrument Type",
+	"instrument_type":      "Instrument Type",
+}
+
+// Method ID mapping: 1=Annuity, 2=Flat
+var methodIDMap = map[string]string{
+	"1": "annuity",
+	"2": "flat",
+}
+
+// DayCount ID mapping: 1=30/360, 2=ACT/360, 3=ACT/365
+var dayCountIDMap = map[string]string{
+	"1": "30/360",
+	"2": "ACT/360",
+	"3": "ACT/365",
 }
 
 // normalizeHeader maps a raw header to its canonical name
@@ -238,39 +259,48 @@ func parseRow(record []string, colIndex map[string]int, rowNum int) (*models.Loa
 	}
 	interestRate := interestRateRaw / 100.0 // Convert percentage to decimal
 
-	// Start Date
-	startDate, err := parseDate(getField("Start Date"))
-	if err != nil {
-		errors = append(errors, models.ValidationError{
-			Row: rowNum, Column: "Start Date",
-			Message: fmt.Sprintf("Invalid date format '%s', expected DD/MM/YYYY", getField("Start Date")),
-		})
+	// Start Date (optional)
+	var startDate time.Time
+	startDateStr := getField("Start Date")
+	if startDateStr != "" {
+		sd, err := parseDate(startDateStr)
+		if err != nil {
+			errors = append(errors, models.ValidationError{
+				Row: rowNum, Column: "Start Date",
+				Message: fmt.Sprintf("Invalid date format '%s', expected DD/MM/YYYY", startDateStr),
+			})
+		} else {
+			startDate = sd
+		}
 	}
 
-	// End Date
-	endDate, err := parseDate(getField("End Date"))
-	if err != nil {
-		errors = append(errors, models.ValidationError{
-			Row: rowNum, Column: "End Date",
-			Message: fmt.Sprintf("Invalid date format '%s', expected DD/MM/YYYY", getField("End Date")),
-		})
+	// End Date (NULLABLE — can be empty)
+	var endDate *time.Time
+	endDateStr := getField("End Date")
+	if endDateStr != "" && strings.ToUpper(endDateStr) != "NULL" && strings.ToUpper(endDateStr) != "NA" && strings.ToUpper(endDateStr) != "N/A" {
+		ed, err := parseDate(endDateStr)
+		if err != nil {
+			errors = append(errors, models.ValidationError{
+				Row: rowNum, Column: "End Date",
+				Message: fmt.Sprintf("Invalid date format '%s', expected DD/MM/YYYY or empty", endDateStr),
+			})
+		} else {
+			endDate = &ed
+		}
 	}
+
 	// Installment Frequency (nullable)
-	// Accepts: numeric (e.g. 1, 3, 12), "Yes"/"No", or empty/NULL
 	var installmentFreq *int
 	instFreqStr := getField("Installment Frequency")
 	upperInstFreq := strings.ToUpper(instFreqStr)
 	if upperInstFreq == "YES" {
-		// "Yes" means installment exists; default to monthly (1)
 		v := 1
 		installmentFreq = &v
 	} else if upperInstFreq == "NO" || upperInstFreq == "NULL" || instFreqStr == "" {
-		// No installment
 		installmentFreq = nil
 	} else {
 		v, err := strconv.Atoi(instFreqStr)
 		if err != nil {
-			// Try parsing as float first
 			fv, ferr := strconv.ParseFloat(instFreqStr, 64)
 			if ferr != nil || math.IsNaN(fv) {
 				errors = append(errors, models.ValidationError{
@@ -289,7 +319,7 @@ func parseRow(record []string, colIndex map[string]int, rowNum int) (*models.Loa
 	// Interest Payment Frequency (nullable)
 	var interestPaymentFreq *int
 	intFreqStr := getField("Interest Payment Frequency")
-	if intFreqStr != "" && strings.ToUpper(intFreqStr) != "NULL" {
+	if intFreqStr != "" && strings.ToUpper(intFreqStr) != "NULL" && strings.ToUpper(intFreqStr) != "NONE" {
 		v, err := strconv.Atoi(intFreqStr)
 		if err != nil {
 			fv, ferr := strconv.ParseFloat(intFreqStr, 64)
@@ -307,30 +337,46 @@ func parseRow(record []string, colIndex map[string]int, rowNum int) (*models.Loa
 		}
 	}
 
-	// Method
-	methodStr := strings.ToLower(getField("Method"))
+	// Method — accepts ID (1=annuity, 2=flat) or string
+	methodStr := strings.TrimSpace(getField("Method"))
 	if methodStr == "" {
 		methodStr = "annuity"
+	} else if mapped, ok := methodIDMap[methodStr]; ok {
+		methodStr = mapped
+	} else {
+		methodStr = strings.ToLower(methodStr)
 	}
 	if methodStr != "annuity" && methodStr != "flat" {
 		errors = append(errors, models.ValidationError{
 			Row: rowNum, Column: "Method",
-			Message: fmt.Sprintf("'%s' is not valid, expected 'annuity' or 'flat'", getField("Method")),
+			Message: fmt.Sprintf("'%s' is not valid, expected 1 (Annuity), 2 (Flat), 'annuity', or 'flat'", getField("Method")),
 		})
 	}
 
-	// Day Count
-	dayCount := getField("Day Count")
+	// Day Count — accepts ID (1=30/360, 2=ACT/360, 3=ACT/365) or string
+	dayCount := strings.TrimSpace(getField("Day Count"))
 	if dayCount == "" {
 		dayCount = "30/360"
+	} else if mapped, ok := dayCountIDMap[dayCount]; ok {
+		dayCount = mapped
 	}
 	validDayCounts := map[string]bool{"30/360": true, "ACT/365": true, "ACT/360": true}
 	if !validDayCounts[dayCount] {
 		errors = append(errors, models.ValidationError{
 			Row: rowNum, Column: "Day Count",
-			Message: fmt.Sprintf("'%s' is not valid, expected '30/360', 'ACT/365', or 'ACT/360'", dayCount),
+			Message: fmt.Sprintf("'%s' is not valid, expected 1 (30/360), 2 (ACT/360), 3 (ACT/365)", getField("Day Count")),
 		})
 	}
+
+	// Default Behaviour (boolean, default true)
+	defaultBehaviour := true
+	dbStr := strings.ToUpper(getField("Default Behaviour"))
+	if dbStr == "FALSE" || dbStr == "0" || dbStr == "NO" {
+		defaultBehaviour = false
+	}
+
+	// Instrument Type (optional)
+	instrumentType := getField("Instrument Type")
 
 	if len(errors) > 0 {
 		return nil, errors
@@ -354,6 +400,8 @@ func parseRow(record []string, colIndex map[string]int, rowNum int) (*models.Loa
 		Method:                   methodStr,
 		InterestPaymentFrequency: interestPaymentFreq,
 		DayCount:                 dayCount,
+		DefaultBehaviour:         defaultBehaviour,
+		InstrumentType:           instrumentType,
 	}, nil
 }
 
@@ -429,14 +477,14 @@ func detectDelimiter(text string) rune {
 			}
 		}
 	}
-	// Need at least 14 delimiters for 15+ columns
-	if tabCount >= 14 {
+	// Need at least 5 delimiters for columns
+	if tabCount >= 5 {
 		return '\t'
 	}
-	if semiCount >= 14 {
+	if semiCount >= 5 {
 		return ';'
 	}
-	if commaCount >= 14 {
+	if commaCount >= 5 {
 		return ','
 	}
 

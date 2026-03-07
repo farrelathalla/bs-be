@@ -40,6 +40,7 @@ func GetPivot(c *gin.Context) {
 		"reporting_date":         "li.reporting_date::text",
 		"day_count":              "li.day_count",
 		"installment_frequency":  "li.installment_frequency::text",
+		"result_type":            "cr.result_type",
 	}
 
 	var selectCols []string
@@ -70,6 +71,7 @@ func GetPivot(c *gin.Context) {
 		"transactional_or_non":   "li.transactional_or_non",
 		"kode_pos":               "li.kode_pos",
 		"account_id":             "li.account_id",
+		"result_type":            "cr.result_type",
 	}
 
 	whereClause := "li.upload_id = $1"

@@ -17,6 +17,7 @@ type User struct {
 	ID           string `json:"id"`
 	Username     string `json:"username"`
 	PasswordHash string `json:"-"`
+	Role         string `json:"role"`
 }
 
 // CashflowResult holds computed bucket values for a single loan
@@ -54,6 +55,7 @@ type ResultRow struct {
 	InterestPaymentFrequency *int             `json:"interest_payment_frequency"`
 	DayCount               string             `json:"day_count"`
 	RemainingDays          int                `json:"remaining_days"`
+	ResultType             string             `json:"result_type"`
 	IRRBBPrincipal         map[string]float64 `json:"irrbb_principal"`
 	IRRBBInterest          map[string]float64 `json:"irrbb_interest"`
 	LCRPrincipal           map[string]float64 `json:"lcr_principal"`

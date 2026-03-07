@@ -85,6 +85,13 @@ func UploadCSV(c *gin.Context) {
 func processLoans(uploadID string, loans []models.Loan) {
 	batchSize := 500
 
+	// Load default behaviour weights once
+	defaultBehaviourID := calculator.LoadDefaultBehaviourID()
+	var defaultWeights calculator.BehaviourWeights
+	if defaultBehaviourID > 0 {
+		defaultWeights = calculator.LoadBehaviourWeights(defaultBehaviourID)
+	}
+
 	for i := 0; i < len(loans); i += batchSize {
 		end := i + batchSize
 		if end > len(loans) {
@@ -92,7 +99,7 @@ func processLoans(uploadID string, loans []models.Loan) {
 		}
 		batch := loans[i:end]
 
-		err := processBatch(uploadID, batch, i)
+		err := processBatch(uploadID, batch, i, defaultWeights)
 		if err != nil {
 			log.Printf("Error processing batch starting at row %d: %v", i, err)
 			config.DB.Exec(
@@ -108,7 +115,7 @@ func processLoans(uploadID string, loans []models.Loan) {
 	log.Printf("Upload %s processed successfully (%d loans)", uploadID, len(loans))
 }
 
-func processBatch(uploadID string, loans []models.Loan, startIdx int) error {
+func processBatch(uploadID string, loans []models.Loan, startIdx int, defaultWeights calculator.BehaviourWeights) error {
 	tx, err := config.DB.Begin()
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
@@ -118,6 +125,14 @@ func processBatch(uploadID string, loans []models.Loan, startIdx int) error {
 	for j, loan := range loans {
 		rowNum := startIdx + j + 1
 
+		// Handle nullable end_date for SQL
+		var endDateSQL interface{}
+		if loan.EndDate != nil {
+			endDateSQL = *loan.EndDate
+		} else {
+			endDateSQL = nil
+		}
+
 		// Insert loan input
 		var loanInputID int64
 		err := tx.QueryRow(
@@ -125,51 +140,198 @@ func processBatch(uploadID string, loans []models.Loan, startIdx int) error {
 				upload_id, row_number, reporting_date, account_id, ccy, outstanding,
 				interest_rate, start_date, end_date, installment_frequency,
 				product_type, segment, daerah, kode_pos, insured_or_uninsured,
-				transactional_or_non, method, interest_payment_frequency, day_count
-			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+				transactional_or_non, method, interest_payment_frequency, day_count,
+				default_behaviour, instrument_type
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
 			RETURNING id`,
 			uploadID, rowNum,
 			loan.ReportingDate, loan.AccountID, loan.CCY, loan.Outstanding,
-			loan.InterestRate, loan.StartDate, loan.EndDate, loan.InstallmentFrequency,
+			loan.InterestRate, loan.StartDate, endDateSQL, loan.InstallmentFrequency,
 			loan.ProductType, loan.Segment, loan.Daerah, loan.KodePos,
 			loan.InsuredOrUninsured, loan.TransactionalOrNon, loan.Method,
 			loan.InterestPaymentFrequency, loan.DayCount,
+			loan.DefaultBehaviour, loan.InstrumentType,
 		).Scan(&loanInputID)
 		if err != nil {
 			return fmt.Errorf("failed to insert loan input row %d: %w", rowNum, err)
 		}
 
-		// Generate schedule & compute buckets
-		schedule := calculator.GenerateSchedule(&loan)
-		irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI := calculator.ComputeAllBuckets(schedule, loan.ReportingDate)
+		// ===== RESULT 1: Normal (only if has end date) =====
+		if loan.HasEndDate() {
+			schedule := calculator.GenerateSchedule(&loan)
+			irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI := calculator.ComputeAllBuckets(schedule, loan.ReportingDate)
 
-		remainingDays := loan.TenorDays()
+			remainingDays := loan.TenorDays()
 
-		// Marshal bucket maps to JSON
-		irrbbPJSON, _ := json.Marshal(irrbbP)
-		irrbbIJSON, _ := json.Marshal(irrbbI)
-		lcrPJSON, _ := json.Marshal(lcrP)
-		lcrIJSON, _ := json.Marshal(lcrI)
-		nsfrPJSON, _ := json.Marshal(nsfrP)
-		nsfrIJSON, _ := json.Marshal(nsfrI)
+			irrbbPJSON, _ := json.Marshal(irrbbP)
+			irrbbIJSON, _ := json.Marshal(irrbbI)
+			lcrPJSON, _ := json.Marshal(lcrP)
+			lcrIJSON, _ := json.Marshal(lcrI)
+			nsfrPJSON, _ := json.Marshal(nsfrP)
+			nsfrIJSON, _ := json.Marshal(nsfrI)
 
-		// Insert cashflow result
-		_, err = tx.Exec(
-			`INSERT INTO cashflow_results (
-				upload_id, loan_input_id, remaining_days,
-				irrbb_principal, irrbb_interest,
-				lcr_principal, lcr_interest,
-				nsfr_principal, nsfr_interest
-			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-			uploadID, loanInputID, remainingDays,
-			irrbbPJSON, irrbbIJSON, lcrPJSON, lcrIJSON, nsfrPJSON, nsfrIJSON,
+			_, err = tx.Exec(
+				`INSERT INTO cashflow_results (
+					upload_id, loan_input_id, remaining_days,
+					irrbb_principal, irrbb_interest,
+					lcr_principal, lcr_interest,
+					nsfr_principal, nsfr_interest,
+					result_type
+				) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+				uploadID, loanInputID, remainingDays,
+				irrbbPJSON, irrbbIJSON, lcrPJSON, lcrIJSON, nsfrPJSON, nsfrIJSON,
+				"Normal",
+			)
+			if err != nil {
+				return fmt.Errorf("failed to insert normal result row %d: %w", rowNum, err)
+			}
+		}
+
+		// ===== RESULT 2: Default Behaviour (always) =====
+		if defaultWeights != nil {
+			irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI := calculator.ComputeBehaviourBuckets(loan.Outstanding, defaultWeights)
+
+			irrbbPJSON, _ := json.Marshal(irrbbP)
+			irrbbIJSON, _ := json.Marshal(irrbbI)
+			lcrPJSON, _ := json.Marshal(lcrP)
+			lcrIJSON, _ := json.Marshal(lcrI)
+			nsfrPJSON, _ := json.Marshal(nsfrP)
+			nsfrIJSON, _ := json.Marshal(nsfrI)
+
+			_, err = tx.Exec(
+				`INSERT INTO cashflow_results (
+					upload_id, loan_input_id, remaining_days,
+					irrbb_principal, irrbb_interest,
+					lcr_principal, lcr_interest,
+					nsfr_principal, nsfr_interest,
+					result_type
+				) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+				uploadID, loanInputID, 0,
+				irrbbPJSON, irrbbIJSON, lcrPJSON, lcrIJSON, nsfrPJSON, nsfrIJSON,
+				"Default Behaviour",
+			)
+			if err != nil {
+				return fmt.Errorf("failed to insert default behaviour result row %d: %w", rowNum, err)
+			}
+		}
+
+		// ===== RESULT 3+: Custom Behaviours (from scenario mappings) =====
+		matchingBehaviours := calculator.GetMatchingBehaviours(
+			uploadID, loan.ProductType, loan.CCY, loan.Segment, loan.TransactionalOrNon,
 		)
-		if err != nil {
-			return fmt.Errorf("failed to insert cashflow result row %d: %w", rowNum, err)
+		for _, mb := range matchingBehaviours {
+			weights := calculator.LoadBehaviourWeights(mb.BehaviourID)
+			if weights == nil {
+				continue
+			}
+
+			irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI := calculator.ComputeBehaviourBuckets(loan.Outstanding, weights)
+
+			irrbbPJSON, _ := json.Marshal(irrbbP)
+			irrbbIJSON, _ := json.Marshal(irrbbI)
+			lcrPJSON, _ := json.Marshal(lcrP)
+			lcrIJSON, _ := json.Marshal(lcrI)
+			nsfrPJSON, _ := json.Marshal(nsfrP)
+			nsfrIJSON, _ := json.Marshal(nsfrI)
+
+			_, err = tx.Exec(
+				`INSERT INTO cashflow_results (
+					upload_id, loan_input_id, remaining_days,
+					irrbb_principal, irrbb_interest,
+					lcr_principal, lcr_interest,
+					nsfr_principal, nsfr_interest,
+					result_type
+				) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+				uploadID, loanInputID, 0,
+				irrbbPJSON, irrbbIJSON, lcrPJSON, lcrIJSON, nsfrPJSON, nsfrIJSON,
+				mb.BehaviourName,
+			)
+			if err != nil {
+				return fmt.Errorf("failed to insert custom behaviour result row %d: %w", rowNum, err)
+			}
 		}
 	}
 
 	return tx.Commit()
+}
+
+// ReprocessUpload re-runs the calculation after behaviours/mappings have been added
+func ReprocessUpload(c *gin.Context) {
+	uploadID := c.Param("id")
+	userID, _ := c.Get("user_id")
+
+	// Verify ownership
+	var status string
+	err := config.DB.QueryRow(
+		"SELECT status FROM uploads WHERE id = $1 AND user_id = $2",
+		uploadID, userID,
+	).Scan(&status)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Upload not found"})
+		return
+	}
+
+	// Delete existing cashflow results
+	config.DB.Exec("DELETE FROM cashflow_results WHERE upload_id = $1", uploadID)
+
+	// Mark as processing
+	config.DB.Exec("UPDATE uploads SET status = 'processing' WHERE id = $1", uploadID)
+
+	// Re-read loans from DB
+	rows, err := config.DB.Query(
+		`SELECT reporting_date, account_id, ccy, outstanding, interest_rate,
+		        start_date, end_date, installment_frequency,
+		        product_type, segment, daerah, kode_pos,
+		        insured_or_uninsured, transactional_or_non, method,
+		        interest_payment_frequency, day_count,
+		        COALESCE(default_behaviour, TRUE), COALESCE(instrument_type, '')
+		 FROM loan_inputs WHERE upload_id = $1 ORDER BY row_number`,
+		uploadID,
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to read loans"})
+		return
+	}
+	defer rows.Close()
+
+	var loans []models.Loan
+	for rows.Next() {
+		var loan models.Loan
+		var endDate sql.NullTime
+		var installmentFreq, interestPaymentFreq sql.NullInt64
+
+		err := rows.Scan(
+			&loan.ReportingDate, &loan.AccountID, &loan.CCY, &loan.Outstanding,
+			&loan.InterestRate, &loan.StartDate, &endDate, &installmentFreq,
+			&loan.ProductType, &loan.Segment, &loan.Daerah, &loan.KodePos,
+			&loan.InsuredOrUninsured, &loan.TransactionalOrNon, &loan.Method,
+			&interestPaymentFreq, &loan.DayCount,
+			&loan.DefaultBehaviour, &loan.InstrumentType,
+		)
+		if err != nil {
+			log.Printf("Error reading loan: %v", err)
+			continue
+		}
+
+		if endDate.Valid {
+			loan.EndDate = &endDate.Time
+		}
+		if installmentFreq.Valid {
+			v := int(installmentFreq.Int64)
+			loan.InstallmentFrequency = &v
+		}
+		if interestPaymentFreq.Valid {
+			v := int(interestPaymentFreq.Int64)
+			loan.InterestPaymentFrequency = &v
+		}
+
+		loans = append(loans, loan)
+	}
+
+	// Process in background
+	go processLoans(uploadID, loans)
+
+	c.JSON(http.StatusOK, gin.H{"message": "Reprocessing started", "total_rows": len(loans)})
 }
 
 func GetUploadStatus(c *gin.Context) {
@@ -259,7 +421,7 @@ func DeleteUpload(c *gin.Context) {
 		return
 	}
 
-	// Delete from DB (cascades to loan_inputs and cashflow_results)
+	// Delete from DB (cascades to loan_inputs, cashflow_results, behaviours, scenario_mappings)
 	config.DB.Exec("DELETE FROM uploads WHERE id = $1", uploadID)
 
 	// Delete file
@@ -299,6 +461,7 @@ func GetResults(c *gin.Context) {
 		"product_type":  "li.product_type",
 		"daerah":        "li.daerah",
 		"method":        "li.method",
+		"result_type":   "cr.result_type",
 	}
 	sortCol, ok := validSortCols[sortBy]
 	if !ok {
@@ -325,6 +488,7 @@ func GetResults(c *gin.Context) {
 		"transactional_or_non":   "li.transactional_or_non",
 		"kode_pos":               "li.kode_pos",
 		"account_id":             "li.account_id",
+		"result_type":            "cr.result_type",
 	}
 
 	for filterKey, filterVal := range filters {
@@ -338,7 +502,9 @@ func GetResults(c *gin.Context) {
 	// Get total count
 	var total int
 	countQuery := fmt.Sprintf(
-		"SELECT COUNT(*) FROM loan_inputs li WHERE %s", whereClause,
+		`SELECT COUNT(*) FROM loan_inputs li
+		 JOIN cashflow_results cr ON cr.loan_input_id = li.id
+		 WHERE %s`, whereClause,
 	)
 	config.DB.QueryRow(countQuery, args...).Scan(&total)
 
@@ -352,7 +518,8 @@ func GetResults(c *gin.Context) {
 		        cr.remaining_days,
 		        cr.irrbb_principal, cr.irrbb_interest,
 		        cr.lcr_principal, cr.lcr_interest,
-		        cr.nsfr_principal, cr.nsfr_interest
+		        cr.nsfr_principal, cr.nsfr_interest,
+		        cr.result_type
 		 FROM loan_inputs li
 		 JOIN cashflow_results cr ON cr.loan_input_id = li.id
 		 WHERE %s
@@ -372,7 +539,9 @@ func GetResults(c *gin.Context) {
 	results := make([]models.ResultRow, 0)
 	for rows.Next() {
 		var r models.ResultRow
-		var reportingDate, startDate, endDate time.Time
+		var reportingDate time.Time
+		var startDate sql.NullTime
+		var endDate sql.NullTime
 		var installmentFreq, interestPaymentFreq sql.NullInt64
 		var irrbbPJSON, irrbbIJSON, lcrPJSON, lcrIJSON, nsfrPJSON, nsfrIJSON []byte
 
@@ -384,6 +553,7 @@ func GetResults(c *gin.Context) {
 			&interestPaymentFreq, &r.DayCount,
 			&r.RemainingDays,
 			&irrbbPJSON, &irrbbIJSON, &lcrPJSON, &lcrIJSON, &nsfrPJSON, &nsfrIJSON,
+			&r.ResultType,
 		)
 		if err != nil {
 			log.Printf("Error scanning row: %v", err)
@@ -391,8 +561,12 @@ func GetResults(c *gin.Context) {
 		}
 
 		r.ReportingDate = reportingDate.Format("02/01/2006")
-		r.StartDate = startDate.Format("02/01/2006")
-		r.EndDate = endDate.Format("02/01/2006")
+		if startDate.Valid {
+			r.StartDate = startDate.Time.Format("02/01/2006")
+		}
+		if endDate.Valid {
+			r.EndDate = endDate.Time.Format("02/01/2006")
+		}
 
 		if installmentFreq.Valid {
 			v := int(installmentFreq.Int64)

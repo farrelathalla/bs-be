@@ -17,6 +17,8 @@ func runMigrations(db *sql.DB) {
 	// Read and execute migration files
 	migrationFiles := []string{
 		"migrations/001_init.sql",
+		"migrations/003_reference_tables.sql",
+		"migrations/004_behaviours.sql",
 	}
 
 	for _, f := range migrationFiles {
@@ -42,8 +44,11 @@ func main() {
 	// Run migrations
 	runMigrations(config.DB)
 
-	// Seed admin user
+	// Seed data
 	config.SeedAdmin()
+	config.SeedSuperAdmin()
+	config.SeedReferenceData()
+	config.SeedDefaultBehaviour()
 
 	// Ensure upload directory exists
 	uploadDir := config.GetUploadDir()
@@ -93,6 +98,33 @@ func main() {
 
 		// Export
 		auth.GET("/export/:id", handlers.ExportExcel)
+
+		// Behaviours (per upload)
+		auth.POST("/uploads/:id/behaviours", handlers.UploadBehaviour)
+		auth.GET("/uploads/:id/behaviours", handlers.ListBehaviours)
+		auth.GET("/behaviours/:id", handlers.GetBehaviour)
+		auth.PUT("/behaviours/:id", handlers.UpdateBehaviour)
+		auth.DELETE("/behaviours/:id", handlers.DeleteBehaviour)
+
+		// Scenario Mappings (per upload)
+		auth.GET("/uploads/:id/mappings", handlers.ListMappings)
+		auth.POST("/uploads/:id/mappings", handlers.CreateMapping)
+		auth.PUT("/mappings/:id", handlers.UpdateMapping)
+		auth.DELETE("/mappings/:id", handlers.DeleteMapping)
+		auth.GET("/uploads/:id/mapping-options", handlers.GetMappingOptions)
+
+		// Reprocess
+		auth.POST("/uploads/:id/reprocess", handlers.ReprocessUpload)
+
+		// Reference tables (superadmin only)
+		admin := auth.Group("")
+		admin.Use(middleware.SuperAdminMiddleware())
+		{
+			admin.GET("/reference/:table", handlers.ListReference)
+			admin.POST("/reference/:table", handlers.CreateReference)
+			admin.PUT("/reference/:table/:id", handlers.UpdateReference)
+			admin.DELETE("/reference/:table/:id", handlers.DeleteReference)
+		}
 	}
 
 	port := os.Getenv("PORT")

@@ -79,7 +79,13 @@ func containsDate(dates []time.Time, target time.Time) bool {
 
 // GenerateSchedule builds the amortization schedule for a loan.
 // This is an exact port of calculator.py Amortization.schedule()
+// Returns empty schedule if EndDate is nil (no maturity)
 func GenerateSchedule(loan *models.Loan) []ScheduleRow {
+	// If no end date, can't generate schedule
+	if loan.EndDate == nil {
+		return []ScheduleRow{}
+	}
+
 	principal := loan.Outstanding
 	originalPrincipal := principal
 	annualRate := loan.InterestRate
@@ -89,7 +95,7 @@ func GenerateSchedule(loan *models.Loan) []ScheduleRow {
 	dayCount := loan.DayCount
 
 	reportingDate := loan.ReportingDate
-	endDate := loan.EndDate
+	endDate := *loan.EndDate
 
 	if !reportingDate.Before(endDate) {
 		return []ScheduleRow{}
