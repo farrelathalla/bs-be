@@ -226,18 +226,16 @@ func processBatch(uploadID string, loans []models.Loan, startIdx int, defaultWei
 		}
 
 		// ===== BASE RESULT (Amortization OR Default Behaviour) =====
-		// If has end_date -> use Amortization schedule
-		// If no end_date -> use Default Behaviour weights
 		var irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI map[string]float64
 		var remainingDays int
+		var baseResultType string
 
 		if loan.HasEndDate() {
-			// Normal calculation: generate amortization schedule
 			schedule := calculator.GenerateSchedule(&loan)
 			irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI = calculator.ComputeAllBuckets(schedule, loan.ReportingDate)
 			remainingDays = loan.TenorDays()
+			baseResultType = "Amortization"
 		} else {
-			// Default behaviour: use weight-based distribution
 			if defaultWeights != nil {
 				irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI = calculator.ComputeBehaviourBuckets(loan.Outstanding, defaultWeights)
 			} else {
@@ -249,10 +247,11 @@ func processBatch(uploadID string, loans []models.Loan, startIdx int, defaultWei
 				nsfrI = calculator.EmptyBucketMap(calculator.NSFRLabels)
 			}
 			remainingDays = 0
+			baseResultType = "Default Behaviour"
 		}
 
 		if err := insertResult(tx, uploadID, loanInputID, remainingDays,
-			irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI, "Base", nil); err != nil {
+			irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI, baseResultType, nil); err != nil {
 			return fmt.Errorf("failed to insert base result row %d: %w", rowNum, err)
 		}
 
@@ -268,7 +267,7 @@ func processBatch(uploadID string, loans []models.Loan, startIdx int, defaultWei
 
 			bid := sc.BehaviourID
 			if err := insertResult(tx, uploadID, loanInputID, remainingDays,
-				scIrrbbP, scIrrbbI, scLcrP, scLcrI, scNsfrP, scNsfrI, "Scenario", &bid); err != nil {
+				scIrrbbP, scIrrbbI, scLcrP, scLcrI, scNsfrP, scNsfrI, sc.BehaviourName, &bid); err != nil {
 				return fmt.Errorf("failed to insert scenario '%s' result row %d: %w", sc.BehaviourName, rowNum, err)
 			}
 		}
@@ -419,11 +418,13 @@ func reprocessBatch(uploadID string, loanRows []loanWithID, defaultWeights calcu
 		// ===== SINGLE RESULT: "Behaviour" =====
 		var irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI map[string]float64
 		var remainingDays int
+		var baseResultType string
 
 		if loan.HasEndDate() {
 			schedule := calculator.GenerateSchedule(&loan)
 			irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI = calculator.ComputeAllBuckets(schedule, loan.ReportingDate)
 			remainingDays = loan.TenorDays()
+			baseResultType = "Amortization"
 		} else {
 			if defaultWeights != nil {
 				irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI = calculator.ComputeBehaviourBuckets(loan.Outstanding, defaultWeights)
@@ -436,10 +437,11 @@ func reprocessBatch(uploadID string, loanRows []loanWithID, defaultWeights calcu
 				nsfrI = calculator.EmptyBucketMap(calculator.NSFRLabels)
 			}
 			remainingDays = 0
+			baseResultType = "Default Behaviour"
 		}
 
 		if err := insertResult(tx, uploadID, loanInputID, remainingDays,
-			irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI, "Base", nil); err != nil {
+			irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI, baseResultType, nil); err != nil {
 			return fmt.Errorf("failed to insert base result: %w", err)
 		}
 
@@ -455,7 +457,7 @@ func reprocessBatch(uploadID string, loanRows []loanWithID, defaultWeights calcu
 
 			bid := sc.BehaviourID
 			if err := insertResult(tx, uploadID, loanInputID, remainingDays,
-				scIrrbbP, scIrrbbI, scLcrP, scLcrI, scNsfrP, scNsfrI, "Scenario", &bid); err != nil {
+				scIrrbbP, scIrrbbI, scLcrP, scLcrI, scNsfrP, scNsfrI, sc.BehaviourName, &bid); err != nil {
 				return fmt.Errorf("failed to insert scenario '%s' result: %w", sc.BehaviourName, err)
 			}
 		}
