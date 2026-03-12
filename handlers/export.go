@@ -20,6 +20,7 @@ func ExportExcel(c *gin.Context) {
 
 	filterType := c.DefaultQuery("filter_type", "both")
 	filtersJSON := c.DefaultQuery("filters", "{}")
+	behaviourID := c.Query("behaviour_id")
 
 	var filters map[string]string
 	json.Unmarshal([]byte(filtersJSON), &filters)
@@ -39,6 +40,14 @@ func ExportExcel(c *gin.Context) {
 	whereClause := "li.upload_id = $1"
 	args := []interface{}{uploadID}
 	argIdx := 2
+
+	if behaviourID != "" && behaviourID != "null" && behaviourID != "base" {
+		whereClause += fmt.Sprintf(" AND cr.behaviour_id = $%d", argIdx)
+		args = append(args, behaviourID)
+		argIdx++
+	} else {
+		whereClause += " AND cr.behaviour_id IS NULL"
+	}
 
 	for filterKey, filterVal := range filters {
 		if dbCol, valid := filterColMap[filterKey]; valid && filterVal != "" {

@@ -160,7 +160,7 @@ func loadScenarios(uploadID string) []scenarioInfo {
 
 // insertResult is a helper that inserts a cashflow_results row
 func insertResult(tx *sql.Tx, uploadID string, loanInputID int64, remainingDays int,
-	irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI map[string]float64, resultType string) error {
+	irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI map[string]float64, resultType string, behaviourID *int64) error {
 
 	irrbbPJSON, _ := json.Marshal(irrbbP)
 	irrbbIJSON, _ := json.Marshal(irrbbI)
@@ -175,11 +175,11 @@ func insertResult(tx *sql.Tx, uploadID string, loanInputID int64, remainingDays 
 			irrbb_principal, irrbb_interest,
 			lcr_principal, lcr_interest,
 			nsfr_principal, nsfr_interest,
-			result_type
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+			result_type, behaviour_id
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
 		uploadID, loanInputID, remainingDays,
 		irrbbPJSON, irrbbIJSON, lcrPJSON, lcrIJSON, nsfrPJSON, nsfrIJSON,
-		resultType,
+		resultType, behaviourID,
 	)
 	return err
 }
@@ -210,8 +210,8 @@ func processBatch(uploadID string, loans []models.Loan, startIdx int, defaultWei
 				interest_rate, start_date, end_date, installment_frequency,
 				product_type, segment, daerah, kode_pos, insured_or_uninsured,
 				transactional_or_non, method, interest_payment_frequency, day_count,
-				default_behaviour, instrument_type
-			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
+				default_behaviour, instrument_type, market_value
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
 			RETURNING id`,
 			uploadID, rowNum,
 			loan.ReportingDate, loan.AccountID, loan.CCY, loan.Outstanding,
@@ -219,13 +219,13 @@ func processBatch(uploadID string, loans []models.Loan, startIdx int, defaultWei
 			loan.ProductType, loan.Segment, loan.Daerah, loan.KodePos,
 			loan.InsuredOrUninsured, loan.TransactionalOrNon, loan.Method,
 			loan.InterestPaymentFrequency, loan.DayCount,
-			loan.DefaultBehaviour, loan.InstrumentType,
+			loan.DefaultBehaviour, loan.InstrumentType, loan.MarketValue,
 		).Scan(&loanInputID)
 		if err != nil {
 			return fmt.Errorf("failed to insert loan input row %d: %w", rowNum, err)
 		}
 
-		// ===== SINGLE RESULT: "Behaviour" =====
+		// ===== BASE RESULT (Amortization OR Default Behaviour) =====
 		// If has end_date -> use Amortization schedule
 		// If no end_date -> use Default Behaviour weights
 		var irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI map[string]float64
@@ -252,8 +252,8 @@ func processBatch(uploadID string, loans []models.Loan, startIdx int, defaultWei
 		}
 
 		if err := insertResult(tx, uploadID, loanInputID, remainingDays,
-			irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI, "Behaviour"); err != nil {
-			return fmt.Errorf("failed to insert behaviour result row %d: %w", rowNum, err)
+			irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI, "Base", nil); err != nil {
+			return fmt.Errorf("failed to insert base result row %d: %w", rowNum, err)
 		}
 
 		// ===== SCENARIO RESULTS =====
@@ -261,13 +261,14 @@ func processBatch(uploadID string, loans []models.Loan, startIdx int, defaultWei
 			scIrrbbP, scIrrbbI, scLcrP, scLcrI, scNsfrP, scNsfrI := calculator.ComputeAllScenarioBuckets(
 				sc.Data,
 				loan.Outstanding,
-				0, // marketValue - not available in current CSV format
+				loan.MarketValue,
 				loan.ProductType, loan.CCY, loan.Segment, loan.TransactionalOrNon,
-				irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI, // fallback to behaviour result
+				irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI, // fallback to base result
 			)
 
+			bid := sc.BehaviourID
 			if err := insertResult(tx, uploadID, loanInputID, remainingDays,
-				scIrrbbP, scIrrbbI, scLcrP, scLcrI, scNsfrP, scNsfrI, sc.BehaviourName); err != nil {
+				scIrrbbP, scIrrbbI, scLcrP, scLcrI, scNsfrP, scNsfrI, "Scenario", &bid); err != nil {
 				return fmt.Errorf("failed to insert scenario '%s' result row %d: %w", sc.BehaviourName, rowNum, err)
 			}
 		}
@@ -306,7 +307,8 @@ func ReprocessUpload(c *gin.Context) {
 		        product_type, segment, daerah, kode_pos,
 		        insured_or_uninsured, transactional_or_non, method,
 		        interest_payment_frequency, day_count,
-		        COALESCE(default_behaviour, TRUE), COALESCE(instrument_type, '')
+		        COALESCE(default_behaviour, TRUE), COALESCE(instrument_type, ''),
+				COALESCE(market_value, 0)
 		 FROM loan_inputs WHERE upload_id = $1 ORDER BY row_number`,
 		uploadID,
 	)
@@ -330,7 +332,7 @@ func ReprocessUpload(c *gin.Context) {
 			&lw.Loan.ProductType, &lw.Loan.Segment, &lw.Loan.Daerah, &lw.Loan.KodePos,
 			&lw.Loan.InsuredOrUninsured, &lw.Loan.TransactionalOrNon, &lw.Loan.Method,
 			&interestPaymentFreq, &lw.Loan.DayCount,
-			&lw.Loan.DefaultBehaviour, &lw.Loan.InstrumentType,
+			&lw.Loan.DefaultBehaviour, &lw.Loan.InstrumentType, &lw.Loan.MarketValue,
 		)
 		if err != nil {
 			log.Printf("Error reading loan: %v", err)
@@ -437,8 +439,8 @@ func reprocessBatch(uploadID string, loanRows []loanWithID, defaultWeights calcu
 		}
 
 		if err := insertResult(tx, uploadID, loanInputID, remainingDays,
-			irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI, "Behaviour"); err != nil {
-			return fmt.Errorf("failed to insert behaviour result: %w", err)
+			irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI, "Base", nil); err != nil {
+			return fmt.Errorf("failed to insert base result: %w", err)
 		}
 
 		// ===== SCENARIO RESULTS =====
@@ -446,13 +448,14 @@ func reprocessBatch(uploadID string, loanRows []loanWithID, defaultWeights calcu
 			scIrrbbP, scIrrbbI, scLcrP, scLcrI, scNsfrP, scNsfrI := calculator.ComputeAllScenarioBuckets(
 				sc.Data,
 				loan.Outstanding,
-				0,
+				loan.MarketValue,
 				loan.ProductType, loan.CCY, loan.Segment, loan.TransactionalOrNon,
 				irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI,
 			)
 
+			bid := sc.BehaviourID
 			if err := insertResult(tx, uploadID, loanInputID, remainingDays,
-				scIrrbbP, scIrrbbI, scLcrP, scLcrI, scNsfrP, scNsfrI, sc.BehaviourName); err != nil {
+				scIrrbbP, scIrrbbI, scLcrP, scLcrI, scNsfrP, scNsfrI, "Scenario", &bid); err != nil {
 				return fmt.Errorf("failed to insert scenario '%s' result: %w", sc.BehaviourName, err)
 			}
 		}
@@ -600,10 +603,20 @@ func GetResults(c *gin.Context) {
 	var filters map[string]string
 	json.Unmarshal([]byte(filtersJSON), &filters)
 
+	behaviourID := c.Query("behaviour_id")
+
 	// Build WHERE clause
 	whereClause := "li.upload_id = $1"
 	args := []interface{}{uploadID}
 	argIdx := 2
+
+	if behaviourID != "" && behaviourID != "null" && behaviourID != "base" {
+		whereClause += fmt.Sprintf(" AND cr.behaviour_id = $%d", argIdx)
+		args = append(args, behaviourID)
+		argIdx++
+	} else {
+		whereClause += " AND cr.behaviour_id IS NULL"
+	}
 
 	filterColMap := map[string]string{
 		"ccy":                    "li.ccy",

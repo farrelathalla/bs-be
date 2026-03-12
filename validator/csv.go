@@ -38,6 +38,7 @@ var OptionalColumns = []string{
 	"Transactional/Non Transactional",
 	"Default Behaviour",
 	"Instrument Type",
+	"Market Value",
 }
 
 // columnAliases maps alternative header names to canonical names
@@ -81,6 +82,9 @@ var columnAliases = map[string]string{
 	"instrument type":      "Instrument Type",
 	"instrumenttype":       "Instrument Type",
 	"instrument_type":      "Instrument Type",
+	"market value":         "Market Value",
+	"marketvalue":          "Market Value",
+	"market_value":         "Market Value",
 }
 
 // Method ID mapping: 1=Annuity, 2=Flat
@@ -378,6 +382,9 @@ func parseRow(record []string, colIndex map[string]int, rowNum int) (*models.Loa
 	// Instrument Type (optional)
 	instrumentType := getField("Instrument Type")
 
+	// Market Value (optional)
+	marketValue, _ := parseNumber(getField("Market Value"))
+
 	if len(errors) > 0 {
 		return nil, errors
 	}
@@ -402,6 +409,7 @@ func parseRow(record []string, colIndex map[string]int, rowNum int) (*models.Loa
 		DayCount:                 dayCount,
 		DefaultBehaviour:         defaultBehaviour,
 		InstrumentType:           instrumentType,
+		MarketValue:              marketValue,
 	}, nil
 }
 

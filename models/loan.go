@@ -23,6 +23,7 @@ type Loan struct {
 	DayCount                 string // 30/360 | ACT/365 | ACT/360
 	DefaultBehaviour         bool   // always apply default behaviour
 	InstrumentType           string
+	MarketValue              float64
 }
 
 // TenorDays returns remaining days from reporting date to end date
