@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"unicode/utf8"
 
 	"bs-be/config"
 	"bs-be/models"
@@ -15,12 +14,12 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// UploadBehaviour parses a behaviour CSV and saves it with a name
+// UploadBehaviour parses a scenario/behaviour CSV and saves it
 func UploadBehaviour(c *gin.Context) {
 	uploadID := c.Param("id")
 	name := c.PostForm("name")
 	if name == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Behaviour name is required"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Scenario name is required"})
 		return
 	}
 
@@ -37,8 +36,8 @@ func UploadBehaviour(c *gin.Context) {
 		return
 	}
 
-	// Parse CSV
-	buckets, parseErrors := parseBehaviourCSV(content)
+	// Parse CSV (2-section format)
+	bucketConfigs, cashflowAssumptions, parseErrors := parseScenarioCSV(content)
 	if len(parseErrors) > 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "CSV parsing errors", "details": parseErrors})
 		return
@@ -52,7 +51,7 @@ func UploadBehaviour(c *gin.Context) {
 		return
 	}
 
-	// Insert behaviour
+	// Insert scenario behaviour
 	tx, err := config.DB.Begin()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start transaction"})
@@ -62,7 +61,7 @@ func UploadBehaviour(c *gin.Context) {
 
 	var behaviourID int64
 	err = tx.QueryRow(
-		"INSERT INTO behaviours (upload_id, name, is_default) VALUES ($1, $2, FALSE) RETURNING id",
+		"INSERT INTO behaviours (upload_id, name, is_default, is_scenario) VALUES ($1, $2, FALSE, TRUE) RETURNING id",
 		uploadID, name,
 	).Scan(&behaviourID)
 	if err != nil {
@@ -70,13 +69,32 @@ func UploadBehaviour(c *gin.Context) {
 		return
 	}
 
-	for _, b := range buckets {
+	// Insert bucket configs
+	for _, b := range bucketConfigs {
 		_, err := tx.Exec(
-			"INSERT INTO behaviour_buckets (behaviour_id, bucket_type, bucket_name, percentage) VALUES ($1, $2, $3, $4)",
+			`INSERT INTO scenario_bucket_configs (
+				behaviour_id, bucket_type, bucket_name, percentage,
+				product_type, ccy, segment, transactional, value_type
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
 			behaviourID, b.BucketType, b.BucketName, b.Percentage,
+			b.ProductType, b.CCY, b.Segment, b.Transactional, b.ValueType,
 		)
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to insert bucket %s/%s: %v", b.BucketType, b.BucketName, err)})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to insert bucket config: %v", err)})
+			return
+		}
+	}
+
+	// Insert cashflow assumptions
+	for _, ca := range cashflowAssumptions {
+		_, err := tx.Exec(
+			`INSERT INTO scenario_cashflow_assumptions (
+				behaviour_id, product_type, ccy, segment, transactional, bucket_type, percentage
+			) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+			behaviourID, ca.ProductType, ca.CCY, ca.Segment, ca.Transactional, ca.BucketType, ca.Percentage,
+		)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to insert cashflow assumption: %v", err)})
 			return
 		}
 	}
@@ -87,10 +105,12 @@ func UploadBehaviour(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusCreated, gin.H{
-		"id":        behaviourID,
-		"upload_id": uploadID,
-		"name":      name,
-		"buckets":   len(buckets),
+		"id":         behaviourID,
+		"upload_id":  uploadID,
+		"name":       name,
+		"is_scenario": true,
+		"buckets":    len(bucketConfigs),
+		"assumptions": len(cashflowAssumptions),
 	})
 }
 
@@ -203,21 +223,41 @@ func UpdateBehaviour(c *gin.Context) {
 			return
 		}
 
-		buckets, parseErrors := parseBehaviourCSV(content)
+		// Parse CSV
+		bucketConfigs, cashflowAssumptions, parseErrors := parseScenarioCSV(content)
 		if len(parseErrors) > 0 {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "CSV parsing errors", "details": parseErrors})
 			return
 		}
 
-		// Delete old buckets and insert new
-		tx.Exec("DELETE FROM behaviour_buckets WHERE behaviour_id = $1", id)
-		for _, b := range buckets {
+		// Delete old data and insert new
+		tx.Exec("DELETE FROM scenario_bucket_configs WHERE behaviour_id = $1", id)
+		tx.Exec("DELETE FROM scenario_cashflow_assumptions WHERE behaviour_id = $1", id)
+
+		for _, b := range bucketConfigs {
 			_, err := tx.Exec(
-				"INSERT INTO behaviour_buckets (behaviour_id, bucket_type, bucket_name, percentage) VALUES ($1, $2, $3, $4)",
+				`INSERT INTO scenario_bucket_configs (
+					behaviour_id, bucket_type, bucket_name, percentage,
+					product_type, ccy, segment, transactional, value_type
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
 				id, b.BucketType, b.BucketName, b.Percentage,
+				b.ProductType, b.CCY, b.Segment, b.Transactional, b.ValueType,
 			)
 			if err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to insert bucket"})
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to insert bucket config"})
+				return
+			}
+		}
+
+		for _, ca := range cashflowAssumptions {
+			_, err := tx.Exec(
+				`INSERT INTO scenario_cashflow_assumptions (
+					behaviour_id, product_type, ccy, segment, transactional, bucket_type, percentage
+				) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+				id, ca.ProductType, ca.CCY, ca.Segment, ca.Transactional, ca.BucketType, ca.Percentage,
+			)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to insert cashflow assumption"})
 				return
 			}
 		}
@@ -250,111 +290,171 @@ func DeleteBehaviour(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Behaviour deleted"})
 }
 
-// parseBehaviourCSV parses a behaviour CSV with columns: Bucket Type, Bucket Name, Percentage
-func parseBehaviourCSV(content []byte) ([]models.BehaviourBucket, []string) {
+// bucketConfigInternal is a helper for parsing Section 1
+type bucketConfigInternal struct {
+	BucketType    string
+	BucketName    string
+	Percentage    float64
+	ProductType   string
+	CCY           string
+	Segment       string
+	Transactional string
+	ValueType     string
+}
+
+// cashflowAssumptionInternal is a helper for parsing Section 2
+type cashflowAssumptionInternal struct {
+	ProductType   string
+	CCY           string
+	Segment       string
+	Transactional string
+	BucketType    string
+	Percentage    float64
+}
+
+func parseScenarioCSV(content []byte) ([]bucketConfigInternal, []cashflowAssumptionInternal, []string) {
 	var errors []string
 
 	text := string(content)
 	// Remove BOM
-	if utf8.RuneCountInString(text) > 0 {
-		r, _ := utf8.DecodeRuneInString(text)
-		if r == '\uFEFF' {
-			text = text[3:]
-		}
+	if strings.HasPrefix(text, "\xef\xbb\xbf") {
+		text = text[3:]
 	}
 
-	// Detect delimiter
+	// Split into two sections by empty lines
+	sections := strings.Split(text, "\n\n")
+	if len(sections) == 1 {
+		// Try carriage return split
+		sections = strings.Split(text, "\r\n\r\n")
+	}
+
+	var bucketConfigs []bucketConfigInternal
+	var cashflowAssumptions []cashflowAssumptionInternal
+
+	// Detect delimiter from first line of first section
 	delimiter := ','
-	firstLine := text
-	if idx := strings.Index(text, "\n"); idx >= 0 {
-		firstLine = text[:idx]
-	}
-	if strings.Count(firstLine, ";") > strings.Count(firstLine, ",") {
-		delimiter = ';'
-	}
-	if strings.Count(firstLine, "\t") > strings.Count(firstLine, string(delimiter)) {
-		delimiter = '\t'
-	}
-
-	csvReader := csv.NewReader(strings.NewReader(text))
-	csvReader.Comma = delimiter
-	csvReader.LazyQuotes = true
-	csvReader.TrimLeadingSpace = true
-
-	header, err := csvReader.Read()
-	if err != nil {
-		errors = append(errors, "Failed to read header: "+err.Error())
-		return nil, errors
-	}
-
-	// Normalize headers
-	colIndex := make(map[string]int)
-	for i, h := range header {
-		lower := strings.ToLower(strings.TrimSpace(h))
-		switch {
-		case strings.Contains(lower, "bucket type") || lower == "buckettype" || lower == "bucket_type":
-			colIndex["bucket_type"] = i
-		case strings.Contains(lower, "bucket name") || lower == "bucketname" || lower == "bucket_name":
-			colIndex["bucket_name"] = i
-		case strings.Contains(lower, "percentage") || lower == "pct" || lower == "percent":
-			colIndex["percentage"] = i
+	if len(sections) > 0 {
+		firstLine := strings.Split(sections[0], "\n")[0]
+		if strings.Count(firstLine, ";") > strings.Count(firstLine, ",") {
+			delimiter = ';'
 		}
 	}
 
-	if _, ok := colIndex["bucket_type"]; !ok {
-		errors = append(errors, "Missing 'Bucket Type' column")
-	}
-	if _, ok := colIndex["bucket_name"]; !ok {
-		errors = append(errors, "Missing 'Bucket Name' column")
-	}
-	if _, ok := colIndex["percentage"]; !ok {
-		errors = append(errors, "Missing 'Percentage' column")
-	}
-	if len(errors) > 0 {
-		return nil, errors
-	}
+	// Section 1: Bucket Configs
+	if len(sections) > 0 {
+		reader := csv.NewReader(strings.NewReader(sections[0]))
+		reader.Comma = delimiter
+		reader.TrimLeadingSpace = true
+		header, err := reader.Read()
+		if err == nil {
+			colMap := make(map[string]int)
+			for i, h := range header {
+				h = strings.ToLower(strings.TrimSpace(h))
+				colMap[h] = i
+			}
 
-	var buckets []models.BehaviourBucket
-	rowNum := 1
-	for {
-		rowNum++
-		record, err := csvReader.Read()
-		if err == io.EOF {
-			break
+			for {
+				record, err := reader.Read()
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					continue
+				}
+
+				b := bucketConfigInternal{ValueType: "Outstanding"}
+				if idx, ok := colMap["bucket type"]; ok && idx < len(record) {
+					b.BucketType = strings.TrimSpace(record[idx])
+				}
+				if idx, ok := colMap["bucket name"]; ok && idx < len(record) {
+					b.BucketName = strings.TrimSpace(record[idx])
+				}
+				if idx, ok := colMap["percentage"]; ok && idx < len(record) {
+					pStr := strings.TrimSuffix(strings.TrimSpace(record[idx]), "%")
+					p, _ := strconv.ParseFloat(pStr, 64)
+					if p > 1.0 {
+						p = p / 100.0
+					}
+					b.Percentage = p
+				}
+				if idx, ok := colMap["producttype"]; ok && idx < len(record) {
+					b.ProductType = strings.TrimSpace(record[idx])
+				}
+				if idx, ok := colMap["ccy"]; ok && idx < len(record) {
+					b.CCY = strings.TrimSpace(record[idx])
+				}
+				if idx, ok := colMap["segment"]; ok && idx < len(record) {
+					b.Segment = strings.TrimSpace(record[idx])
+				}
+				if idx, ok := colMap["transactional/non transactional"]; ok && idx < len(record) {
+					b.Transactional = strings.TrimSpace(record[idx])
+				}
+				if idx, ok := colMap["value type"]; ok && idx < len(record) {
+					b.ValueType = strings.TrimSpace(record[idx])
+				}
+
+				if b.BucketType != "" && b.BucketName != "" {
+					bucketConfigs = append(bucketConfigs, b)
+				}
+			}
 		}
-		if err != nil {
-			errors = append(errors, fmt.Sprintf("Row %d: parse error: %v", rowNum, err))
-			continue
-		}
-
-		bucketType := strings.TrimSpace(record[colIndex["bucket_type"]])
-		bucketName := strings.TrimSpace(record[colIndex["bucket_name"]])
-		pctStr := strings.TrimSpace(record[colIndex["percentage"]])
-
-		if bucketType == "" || bucketName == "" {
-			errors = append(errors, fmt.Sprintf("Row %d: bucket_type and bucket_name are required", rowNum))
-			continue
-		}
-
-		// Parse percentage - support both 0.5 and 50% formats
-		pctStr = strings.TrimSuffix(pctStr, "%")
-		pct, err := strconv.ParseFloat(pctStr, 64)
-		if err != nil {
-			errors = append(errors, fmt.Sprintf("Row %d: invalid percentage '%s'", rowNum, pctStr))
-			continue
-		}
-
-		// If value > 1, assume it's a percentage and convert
-		if pct > 1.0 {
-			pct = pct / 100.0
-		}
-
-		buckets = append(buckets, models.BehaviourBucket{
-			BucketType: strings.ToUpper(bucketType),
-			BucketName: bucketName,
-			Percentage: pct,
-		})
 	}
 
-	return buckets, errors
+	// Section 2: Cashflow Assumptions
+	if len(sections) > 1 {
+		reader := csv.NewReader(strings.NewReader(sections[1]))
+		reader.Comma = delimiter
+		reader.TrimLeadingSpace = true
+		header, err := reader.Read()
+		if err == nil {
+			colMap := make(map[string]int)
+			for i, h := range header {
+				h = strings.ToLower(strings.TrimSpace(h))
+				colMap[h] = i
+			}
+
+			for {
+				record, err := reader.Read()
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					continue
+				}
+
+				ca := cashflowAssumptionInternal{Percentage: 1.0}
+				if idx, ok := colMap["producttype"]; ok && idx < len(record) {
+					ca.ProductType = strings.TrimSpace(record[idx])
+				}
+				if idx, ok := colMap["ccy"]; ok && idx < len(record) {
+					ca.CCY = strings.TrimSpace(record[idx])
+				}
+				if idx, ok := colMap["segment"]; ok && idx < len(record) {
+					ca.Segment = strings.TrimSpace(record[idx])
+				}
+				if idx, ok := colMap["transactional/non transactional"]; ok && idx < len(record) {
+					ca.Transactional = strings.TrimSpace(record[idx])
+				}
+				if idx, ok := colMap["bucket type"]; ok && idx < len(record) {
+					ca.BucketType = strings.TrimSpace(record[idx])
+				}
+				if idx, ok := colMap["cashflow assumption"]; ok && idx < len(record) {
+					pStr := strings.TrimSuffix(strings.TrimSpace(record[idx]), "%")
+					p, _ := strconv.ParseFloat(pStr, 64)
+					// Multipliers like 2.0 should stay as 2.0, only percentages like 90% should be converted if > 1 and ends in %
+					// If it doesn't end in %, we assume it's a multiplier.
+					if strings.HasSuffix(strings.TrimSpace(record[idx]), "%") && p > 1.0 {
+						p = p / 100.0
+					}
+					ca.Percentage = p
+				}
+
+				if ca.BucketType != "" {
+					cashflowAssumptions = append(cashflowAssumptions, ca)
+				}
+			}
+		}
+	}
+
+	return bucketConfigs, cashflowAssumptions, errors
 }

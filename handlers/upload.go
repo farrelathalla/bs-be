@@ -88,6 +88,13 @@ func UploadCSV(c *gin.Context) {
 	})
 }
 
+// scenarioInfo holds a loaded scenario for batch processing
+type scenarioInfo struct {
+	BehaviourID   int64
+	BehaviourName string
+	Data          *calculator.ScenarioData
+}
+
 func processLoans(uploadID string, loans []models.Loan) {
 	batchSize := 500
 
@@ -98,6 +105,9 @@ func processLoans(uploadID string, loans []models.Loan) {
 		defaultWeights = calculator.LoadBehaviourWeights(defaultBehaviourID)
 	}
 
+	// Load scenarios (custom behaviours that are scenarios)
+	scenarios := loadScenarios(uploadID)
+
 	for i := 0; i < len(loans); i += batchSize {
 		end := i + batchSize
 		if end > len(loans) {
@@ -105,7 +115,7 @@ func processLoans(uploadID string, loans []models.Loan) {
 		}
 		batch := loans[i:end]
 
-		err := processBatch(uploadID, batch, i, defaultWeights)
+		err := processBatch(uploadID, batch, i, defaultWeights, scenarios)
 		if err != nil {
 			log.Printf("Error processing batch starting at row %d: %v", i, err)
 			config.DB.Exec(
@@ -121,7 +131,60 @@ func processLoans(uploadID string, loans []models.Loan) {
 	log.Printf("Upload %s processed successfully (%d loans)", uploadID, len(loans))
 }
 
-func processBatch(uploadID string, loans []models.Loan, startIdx int, defaultWeights calculator.BehaviourWeights) error {
+// loadScenarios loads all scenario behaviours for an upload
+func loadScenarios(uploadID string) []scenarioInfo {
+	var scenarios []scenarioInfo
+
+	rows, err := config.DB.Query(
+		`SELECT id, name FROM behaviours
+		 WHERE upload_id = $1 AND is_default = FALSE AND is_scenario = TRUE
+		 ORDER BY id`,
+		uploadID,
+	)
+	if err != nil {
+		log.Printf("Failed to load scenarios for upload %s: %v", uploadID, err)
+		return scenarios
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var si scenarioInfo
+		if rows.Scan(&si.BehaviourID, &si.BehaviourName) == nil {
+			si.Data = calculator.LoadScenarioData(si.BehaviourID)
+			scenarios = append(scenarios, si)
+		}
+	}
+
+	return scenarios
+}
+
+// insertResult is a helper that inserts a cashflow_results row
+func insertResult(tx *sql.Tx, uploadID string, loanInputID int64, remainingDays int,
+	irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI map[string]float64, resultType string) error {
+
+	irrbbPJSON, _ := json.Marshal(irrbbP)
+	irrbbIJSON, _ := json.Marshal(irrbbI)
+	lcrPJSON, _ := json.Marshal(lcrP)
+	lcrIJSON, _ := json.Marshal(lcrI)
+	nsfrPJSON, _ := json.Marshal(nsfrP)
+	nsfrIJSON, _ := json.Marshal(nsfrI)
+
+	_, err := tx.Exec(
+		`INSERT INTO cashflow_results (
+			upload_id, loan_input_id, remaining_days,
+			irrbb_principal, irrbb_interest,
+			lcr_principal, lcr_interest,
+			nsfr_principal, nsfr_interest,
+			result_type
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+		uploadID, loanInputID, remainingDays,
+		irrbbPJSON, irrbbIJSON, lcrPJSON, lcrIJSON, nsfrPJSON, nsfrIJSON,
+		resultType,
+	)
+	return err
+}
+
+func processBatch(uploadID string, loans []models.Loan, startIdx int, defaultWeights calculator.BehaviourWeights, scenarios []scenarioInfo) error {
 	tx, err := config.DB.Begin()
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
@@ -162,98 +225,50 @@ func processBatch(uploadID string, loans []models.Loan, startIdx int, defaultWei
 			return fmt.Errorf("failed to insert loan input row %d: %w", rowNum, err)
 		}
 
-		// ===== RESULT 1: Normal (only if has end date) =====
+		// ===== SINGLE RESULT: "Behaviour" =====
+		// If has end_date -> use Amortization schedule
+		// If no end_date -> use Default Behaviour weights
+		var irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI map[string]float64
+		var remainingDays int
+
 		if loan.HasEndDate() {
+			// Normal calculation: generate amortization schedule
 			schedule := calculator.GenerateSchedule(&loan)
-			irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI := calculator.ComputeAllBuckets(schedule, loan.ReportingDate)
-
-			remainingDays := loan.TenorDays()
-
-			irrbbPJSON, _ := json.Marshal(irrbbP)
-			irrbbIJSON, _ := json.Marshal(irrbbI)
-			lcrPJSON, _ := json.Marshal(lcrP)
-			lcrIJSON, _ := json.Marshal(lcrI)
-			nsfrPJSON, _ := json.Marshal(nsfrP)
-			nsfrIJSON, _ := json.Marshal(nsfrI)
-
-			_, err = tx.Exec(
-				`INSERT INTO cashflow_results (
-					upload_id, loan_input_id, remaining_days,
-					irrbb_principal, irrbb_interest,
-					lcr_principal, lcr_interest,
-					nsfr_principal, nsfr_interest,
-					result_type
-				) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-				uploadID, loanInputID, remainingDays,
-				irrbbPJSON, irrbbIJSON, lcrPJSON, lcrIJSON, nsfrPJSON, nsfrIJSON,
-				"Normal",
-			)
-			if err != nil {
-				return fmt.Errorf("failed to insert normal result row %d: %w", rowNum, err)
+			irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI = calculator.ComputeAllBuckets(schedule, loan.ReportingDate)
+			remainingDays = loan.TenorDays()
+		} else {
+			// Default behaviour: use weight-based distribution
+			if defaultWeights != nil {
+				irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI = calculator.ComputeBehaviourBuckets(loan.Outstanding, defaultWeights)
+			} else {
+				irrbbP = calculator.EmptyBucketMap(calculator.IRRBBLabels)
+				irrbbI = calculator.EmptyBucketMap(calculator.IRRBBLabels)
+				lcrP = calculator.EmptyBucketMap(calculator.LCRLabels)
+				lcrI = calculator.EmptyBucketMap(calculator.LCRLabels)
+				nsfrP = calculator.EmptyBucketMap(calculator.NSFRLabels)
+				nsfrI = calculator.EmptyBucketMap(calculator.NSFRLabels)
 			}
+			remainingDays = 0
 		}
 
-		// ===== RESULT 2: Default Behaviour (always) =====
-		if defaultWeights != nil {
-			irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI := calculator.ComputeBehaviourBuckets(loan.Outstanding, defaultWeights)
-
-			irrbbPJSON, _ := json.Marshal(irrbbP)
-			irrbbIJSON, _ := json.Marshal(irrbbI)
-			lcrPJSON, _ := json.Marshal(lcrP)
-			lcrIJSON, _ := json.Marshal(lcrI)
-			nsfrPJSON, _ := json.Marshal(nsfrP)
-			nsfrIJSON, _ := json.Marshal(nsfrI)
-
-			_, err = tx.Exec(
-				`INSERT INTO cashflow_results (
-					upload_id, loan_input_id, remaining_days,
-					irrbb_principal, irrbb_interest,
-					lcr_principal, lcr_interest,
-					nsfr_principal, nsfr_interest,
-					result_type
-				) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-				uploadID, loanInputID, 0,
-				irrbbPJSON, irrbbIJSON, lcrPJSON, lcrIJSON, nsfrPJSON, nsfrIJSON,
-				"Default Behaviour",
-			)
-			if err != nil {
-				return fmt.Errorf("failed to insert default behaviour result row %d: %w", rowNum, err)
-			}
+		if err := insertResult(tx, uploadID, loanInputID, remainingDays,
+			irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI, "Behaviour"); err != nil {
+			return fmt.Errorf("failed to insert behaviour result row %d: %w", rowNum, err)
 		}
 
-		// ===== RESULT 3+: Custom Behaviours (from scenario mappings) =====
-		matchingBehaviours := calculator.GetMatchingBehaviours(
-			uploadID, loan.ProductType, loan.CCY, loan.Segment, loan.TransactionalOrNon,
-		)
-		for _, mb := range matchingBehaviours {
-			weights := calculator.LoadBehaviourWeights(mb.BehaviourID)
-			if weights == nil {
-				continue
-			}
-
-			irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI := calculator.ComputeBehaviourBuckets(loan.Outstanding, weights)
-
-			irrbbPJSON, _ := json.Marshal(irrbbP)
-			irrbbIJSON, _ := json.Marshal(irrbbI)
-			lcrPJSON, _ := json.Marshal(lcrP)
-			lcrIJSON, _ := json.Marshal(lcrI)
-			nsfrPJSON, _ := json.Marshal(nsfrP)
-			nsfrIJSON, _ := json.Marshal(nsfrI)
-
-			_, err = tx.Exec(
-				`INSERT INTO cashflow_results (
-					upload_id, loan_input_id, remaining_days,
-					irrbb_principal, irrbb_interest,
-					lcr_principal, lcr_interest,
-					nsfr_principal, nsfr_interest,
-					result_type
-				) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-				uploadID, loanInputID, 0,
-				irrbbPJSON, irrbbIJSON, lcrPJSON, lcrIJSON, nsfrPJSON, nsfrIJSON,
-				mb.BehaviourName,
+		// ===== SCENARIO RESULTS =====
+		for _, sc := range scenarios {
+			scIrrbbP, scIrrbbI, scLcrP, scLcrI, scNsfrP, scNsfrI := calculator.ComputeAllScenarioBuckets(
+				sc.Data,
+				loan.Outstanding,
+				0, // marketValue - not available in current CSV format
+				loan.ProductType, loan.CCY, loan.Segment, loan.TransactionalOrNon,
+				irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI, // fallback to behaviour result
 			)
-			if err != nil {
-				return fmt.Errorf("failed to insert custom behaviour result row %d: %w", rowNum, err)
+
+			if err := insertResult(tx, uploadID, loanInputID, remainingDays,
+				scIrrbbP, scIrrbbI, scLcrP, scLcrI, scNsfrP, scNsfrI, sc.BehaviourName); err != nil {
+				return fmt.Errorf("failed to insert scenario '%s' result row %d: %w", sc.BehaviourName, rowNum, err)
 			}
 		}
 	}
@@ -361,6 +376,9 @@ func reprocessFromDB(uploadID string, loanRows []loanWithID) {
 		defaultWeights = calculator.LoadBehaviourWeights(defaultBehaviourID)
 	}
 
+	// Load scenarios
+	scenarios := loadScenarios(uploadID)
+
 	batchSize := 500
 	for i := 0; i < len(loanRows); i += batchSize {
 		end := i + batchSize
@@ -369,7 +387,7 @@ func reprocessFromDB(uploadID string, loanRows []loanWithID) {
 		}
 		batch := loanRows[i:end]
 
-		err := reprocessBatch(uploadID, batch, defaultWeights)
+		err := reprocessBatch(uploadID, batch, defaultWeights, scenarios)
 		if err != nil {
 			log.Printf("Error reprocessing batch starting at %d: %v", i, err)
 			config.DB.Exec(
@@ -385,7 +403,7 @@ func reprocessFromDB(uploadID string, loanRows []loanWithID) {
 }
 
 // reprocessBatch generates cashflow_results for existing loan_inputs (does NOT re-insert loan_inputs)
-func reprocessBatch(uploadID string, loanRows []loanWithID, defaultWeights calculator.BehaviourWeights) error {
+func reprocessBatch(uploadID string, loanRows []loanWithID, defaultWeights calculator.BehaviourWeights, scenarios []scenarioInfo) error {
 	tx, err := config.DB.Begin()
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
@@ -396,98 +414,46 @@ func reprocessBatch(uploadID string, loanRows []loanWithID, defaultWeights calcu
 		loanInputID := lw.InputID
 		loan := lw.Loan
 
-		// ===== RESULT 1: Normal (only if has end date) =====
+		// ===== SINGLE RESULT: "Behaviour" =====
+		var irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI map[string]float64
+		var remainingDays int
+
 		if loan.HasEndDate() {
 			schedule := calculator.GenerateSchedule(&loan)
-			irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI := calculator.ComputeAllBuckets(schedule, loan.ReportingDate)
-
-			remainingDays := loan.TenorDays()
-
-			irrbbPJSON, _ := json.Marshal(irrbbP)
-			irrbbIJSON, _ := json.Marshal(irrbbI)
-			lcrPJSON, _ := json.Marshal(lcrP)
-			lcrIJSON, _ := json.Marshal(lcrI)
-			nsfrPJSON, _ := json.Marshal(nsfrP)
-			nsfrIJSON, _ := json.Marshal(nsfrI)
-
-			_, err = tx.Exec(
-				`INSERT INTO cashflow_results (
-					upload_id, loan_input_id, remaining_days,
-					irrbb_principal, irrbb_interest,
-					lcr_principal, lcr_interest,
-					nsfr_principal, nsfr_interest,
-					result_type
-				) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-				uploadID, loanInputID, remainingDays,
-				irrbbPJSON, irrbbIJSON, lcrPJSON, lcrIJSON, nsfrPJSON, nsfrIJSON,
-				"Normal",
-			)
-			if err != nil {
-				return fmt.Errorf("failed to insert normal result: %w", err)
+			irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI = calculator.ComputeAllBuckets(schedule, loan.ReportingDate)
+			remainingDays = loan.TenorDays()
+		} else {
+			if defaultWeights != nil {
+				irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI = calculator.ComputeBehaviourBuckets(loan.Outstanding, defaultWeights)
+			} else {
+				irrbbP = calculator.EmptyBucketMap(calculator.IRRBBLabels)
+				irrbbI = calculator.EmptyBucketMap(calculator.IRRBBLabels)
+				lcrP = calculator.EmptyBucketMap(calculator.LCRLabels)
+				lcrI = calculator.EmptyBucketMap(calculator.LCRLabels)
+				nsfrP = calculator.EmptyBucketMap(calculator.NSFRLabels)
+				nsfrI = calculator.EmptyBucketMap(calculator.NSFRLabels)
 			}
+			remainingDays = 0
 		}
 
-		// ===== RESULT 2: Default Behaviour (always) =====
-		if defaultWeights != nil {
-			irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI := calculator.ComputeBehaviourBuckets(loan.Outstanding, defaultWeights)
-
-			irrbbPJSON, _ := json.Marshal(irrbbP)
-			irrbbIJSON, _ := json.Marshal(irrbbI)
-			lcrPJSON, _ := json.Marshal(lcrP)
-			lcrIJSON, _ := json.Marshal(lcrI)
-			nsfrPJSON, _ := json.Marshal(nsfrP)
-			nsfrIJSON, _ := json.Marshal(nsfrI)
-
-			_, err = tx.Exec(
-				`INSERT INTO cashflow_results (
-					upload_id, loan_input_id, remaining_days,
-					irrbb_principal, irrbb_interest,
-					lcr_principal, lcr_interest,
-					nsfr_principal, nsfr_interest,
-					result_type
-				) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-				uploadID, loanInputID, 0,
-				irrbbPJSON, irrbbIJSON, lcrPJSON, lcrIJSON, nsfrPJSON, nsfrIJSON,
-				"Default Behaviour",
-			)
-			if err != nil {
-				return fmt.Errorf("failed to insert default behaviour result: %w", err)
-			}
+		if err := insertResult(tx, uploadID, loanInputID, remainingDays,
+			irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI, "Behaviour"); err != nil {
+			return fmt.Errorf("failed to insert behaviour result: %w", err)
 		}
 
-		// ===== RESULT 3+: Custom Behaviours (from scenario mappings) =====
-		matchingBehaviours := calculator.GetMatchingBehaviours(
-			uploadID, loan.ProductType, loan.CCY, loan.Segment, loan.TransactionalOrNon,
-		)
-		for _, mb := range matchingBehaviours {
-			weights := calculator.LoadBehaviourWeights(mb.BehaviourID)
-			if weights == nil {
-				continue
-			}
-
-			irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI := calculator.ComputeBehaviourBuckets(loan.Outstanding, weights)
-
-			irrbbPJSON, _ := json.Marshal(irrbbP)
-			irrbbIJSON, _ := json.Marshal(irrbbI)
-			lcrPJSON, _ := json.Marshal(lcrP)
-			lcrIJSON, _ := json.Marshal(lcrI)
-			nsfrPJSON, _ := json.Marshal(nsfrP)
-			nsfrIJSON, _ := json.Marshal(nsfrI)
-
-			_, err = tx.Exec(
-				`INSERT INTO cashflow_results (
-					upload_id, loan_input_id, remaining_days,
-					irrbb_principal, irrbb_interest,
-					lcr_principal, lcr_interest,
-					nsfr_principal, nsfr_interest,
-					result_type
-				) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-				uploadID, loanInputID, 0,
-				irrbbPJSON, irrbbIJSON, lcrPJSON, lcrIJSON, nsfrPJSON, nsfrIJSON,
-				mb.BehaviourName,
+		// ===== SCENARIO RESULTS =====
+		for _, sc := range scenarios {
+			scIrrbbP, scIrrbbI, scLcrP, scLcrI, scNsfrP, scNsfrI := calculator.ComputeAllScenarioBuckets(
+				sc.Data,
+				loan.Outstanding,
+				0,
+				loan.ProductType, loan.CCY, loan.Segment, loan.TransactionalOrNon,
+				irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI,
 			)
-			if err != nil {
-				return fmt.Errorf("failed to insert custom behaviour result: %w", err)
+
+			if err := insertResult(tx, uploadID, loanInputID, remainingDays,
+				scIrrbbP, scIrrbbI, scLcrP, scLcrI, scNsfrP, scNsfrI, sc.BehaviourName); err != nil {
+				return fmt.Errorf("failed to insert scenario '%s' result: %w", sc.BehaviourName, err)
 			}
 		}
 	}

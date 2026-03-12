@@ -5,25 +5,25 @@ import (
 	"time"
 )
 
-// Bucket labels - mirrors Python bucket.py
+// Bucket labels - mirrors Python bucket.py exactly
 var IRRBBLabels = []string{
-	"≤ 1 bulan",
-	"1-3 bulan",
-	"3-6 bulan",
-	"6-9 bulan",
-	"9-12 bulan",
-	"1-1.5Y",
-	"1.5-2Y",
-	"2-3Y",
-	"3-4Y",
-	"4-5Y",
-	"5-6Y",
-	"6-7Y",
-	"7-8Y",
-	"8-9Y",
-	"9-10Y",
-	"10-15Y",
-	"15-20Y",
+	"≤ 1 M",
+	"1M ≤ 3M",
+	"3M ≤ 6M",
+	"6M ≤ 9M",
+	"9M ≤ 1Y",
+	"1Y ≤ 1.5Y",
+	"1.5Y ≤ 2Y",
+	"2Y ≤ 3Y",
+	"3Y ≤ 4Y",
+	"4Y ≤ 5Y",
+	"5Y ≤ 6Y",
+	"6Y ≤ 7Y",
+	"7Y ≤ 8Y",
+	"8Y ≤ 9Y",
+	"9Y ≤ 10Y",
+	"10Y ≤ 15Y",
+	"15Y ≤ 20Y",
 	"> 20Y",
 }
 
@@ -34,8 +34,8 @@ var IRRBBMonthEdges = []float64{
 	180, 240, math.Inf(1),
 }
 
-var LCRLabels = []string{"≤30D", ">30D"}
-var NSFRLabels = []string{"<6M", "6-12M", ">12M"}
+var LCRLabels = []string{"CF <= 30D", "CF > 30D"}
+var NSFRLabels = []string{"CF < 6M", "CF 6M to 12M", "CF > 12M"}
 
 // EmptyBucketMap creates a map with all bucket labels set to 0
 func EmptyBucketMap(labels []string) map[string]float64 {
@@ -56,7 +56,7 @@ func monthsBetween(a, b time.Time) int {
 
 func getIRRBBBucket(days, months int) string {
 	if days <= 30 {
-		return "≤ 1 bulan"
+		return "≤ 1 M"
 	}
 
 	m := float64(months)
@@ -76,7 +76,7 @@ func getIRRBBBucket(days, months int) string {
 // ComputeAllBuckets computes all 6 bucket maps from a schedule.
 // Exact port of calculator.py get_bucket_all.
 // Special rules:
-//   - LCR interest: only counted for ≤30D bucket
+//   - LCR interest: only counted for <=30D bucket
 //   - NSFR interest: always 0
 func ComputeAllBuckets(schedule []ScheduleRow, reportingDate time.Time) (
 	irrbbPrincipal, irrbbInterest,
@@ -105,19 +105,19 @@ func ComputeAllBuckets(schedule []ScheduleRow, reportingDate time.Time) (
 
 		// LCR
 		if days <= 30 {
-			lcrPrincipal["≤30D"] += row.Principal
-			lcrInterest["≤30D"] += row.Interest
+			lcrPrincipal["CF <= 30D"] += row.Principal
+			lcrInterest["CF <= 30D"] += row.Interest
 		} else {
-			lcrPrincipal[">30D"] += row.Principal
+			lcrPrincipal["CF > 30D"] += row.Principal
 		}
 
 		// NSFR (interest always 0)
 		if months < 6 {
-			nsfrPrincipal["<6M"] += row.Principal
+			nsfrPrincipal["CF < 6M"] += row.Principal
 		} else if months <= 12 {
-			nsfrPrincipal["6-12M"] += row.Principal
+			nsfrPrincipal["CF 6M to 12M"] += row.Principal
 		} else {
-			nsfrPrincipal[">12M"] += row.Principal
+			nsfrPrincipal["CF > 12M"] += row.Principal
 		}
 	}
 

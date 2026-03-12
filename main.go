@@ -19,6 +19,7 @@ func runMigrations(db *sql.DB) {
 		"migrations/001_init.sql",
 		"migrations/003_reference_tables.sql",
 		"migrations/004_behaviours.sql",
+		"migrations/005_scenarios.sql",
 	}
 
 	for _, f := range migrationFiles {

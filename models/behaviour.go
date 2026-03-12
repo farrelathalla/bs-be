@@ -6,11 +6,12 @@ import "time"
 type Behaviour struct {
 	ID        int64             `json:"id"`
 	UploadID  *string           `json:"upload_id,omitempty"` // nil for global/default
-	Name      string            `json:"name"`
-	IsDefault bool              `json:"is_default"`
-	CreatedAt time.Time         `json:"created_at"`
-	UpdatedAt time.Time         `json:"updated_at"`
-	Buckets   []BehaviourBucket `json:"buckets,omitempty"`
+	Name       string            `json:"name"`
+	IsDefault  bool              `json:"is_default"`
+	IsScenario bool              `json:"is_scenario"`
+	CreatedAt  time.Time         `json:"created_at"`
+	UpdatedAt  time.Time         `json:"updated_at"`
+	Buckets    []BehaviourBucket `json:"buckets,omitempty"`
 }
 
 // BehaviourBucket represents a single bucket percentage within a behaviour

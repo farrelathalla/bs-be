@@ -96,42 +96,221 @@ func ComputeBehaviourBuckets(outstanding float64, weights BehaviourWeights) (
 	return
 }
 
-// GetMatchingBehaviours returns behaviour IDs and names that match a loan's criteria for a given upload
-// Empty mapping fields act as wildcards (match any value)
-func GetMatchingBehaviours(uploadID, productType, ccy, segment, transactional string) []struct {
-	BehaviourID   int64
-	BehaviourName string
-} {
+// ScenarioBucketConfig holds the parsed Bucket sheet configuration for a scenario
+type ScenarioBucketConfig struct {
+	ProductType   string
+	CCY           string
+	Segment       string
+	Transactional string
+	ValueType     string // "Outstanding" or "Market"
+	BucketType    string // "LCR", "NSFR", "IRRBB"
+	Config        map[string]float64 // bucket_name -> percentage
+}
+
+// ScenarioCashflowAssumption holds the Cashflow Assumption multiplier
+type ScenarioCashflowAssumption struct {
+	ProductType   string
+	CCY           string
+	Segment       string
+	Transactional string
+	BucketType    string
+	Percentage    float64
+}
+
+// ScenarioData holds parsed scenario data (Bucket + Cashflow Assumption)
+type ScenarioData struct {
+	BucketConfigs        []ScenarioBucketConfig
+	CashflowAssumptions  []ScenarioCashflowAssumption
+}
+
+// FindMatchingConfig finds the first bucket config matching loan criteria
+func (sd *ScenarioData) FindMatchingConfig(productType, ccy, segment, transactional, bucketType string) *ScenarioBucketConfig {
+	for i, cfg := range sd.BucketConfigs {
+		if cfg.BucketType != bucketType {
+			continue
+		}
+		if (cfg.ProductType == productType || cfg.ProductType == "All" || cfg.ProductType == "") &&
+			(cfg.CCY == ccy || cfg.CCY == "All" || cfg.CCY == "") &&
+			(cfg.Segment == segment || cfg.Segment == "All" || cfg.Segment == "") &&
+			(cfg.Transactional == transactional || cfg.Transactional == "All" || cfg.Transactional == "") {
+			return &sd.BucketConfigs[i]
+		}
+	}
+	return nil
+}
+
+// FindCashflowAssumption finds the cashflow assumption multiplier
+func (sd *ScenarioData) FindCashflowAssumption(productType, ccy, segment, transactional, bucketType string) float64 {
+	for _, ca := range sd.CashflowAssumptions {
+		if ca.BucketType != bucketType {
+			continue
+		}
+		if (ca.ProductType == productType || ca.ProductType == "All" || ca.ProductType == "") &&
+			(ca.CCY == ccy || ca.CCY == "All" || ca.CCY == "") &&
+			(ca.Segment == segment || ca.Segment == "All" || ca.Segment == "") &&
+			(ca.Transactional == transactional || ca.Transactional == "All" || ca.Transactional == "") {
+			return ca.Percentage
+		}
+	}
+	return 1.0 // default: no multiplier
+}
+
+// ComputeScenarioBuckets computes bucket values using scenario config for a single bucket type.
+// It looks up the matching config, applies percentage * base_value * cashflow_assumption.
+// If no matching config found, returns nil (caller should use fallback).
+func ComputeScenarioBucketsForType(
+	sd *ScenarioData,
+	bucketType string,
+	labels []string,
+	outstanding float64,
+	marketValue float64,
+	productType, ccy, segment, transactional string,
+) (map[string]float64, bool) {
+	cfg := sd.FindMatchingConfig(productType, ccy, segment, transactional, bucketType)
+	if cfg == nil {
+		return nil, false
+	}
+
+	assumption := sd.FindCashflowAssumption(productType, ccy, segment, transactional, bucketType)
+
+	// Determine base value from Value Type
+	baseValue := outstanding
+	if cfg.ValueType == "Market" {
+		if marketValue > 0 {
+			baseValue = marketValue
+		}
+		// if no market value, fallback to outstanding
+	}
+
+	result := EmptyBucketMap(labels)
+	for label := range result {
+		if pct, exists := cfg.Config[label]; exists {
+			result[label] = Round2(baseValue * pct * assumption)
+		}
+	}
+
+	return result, true
+}
+
+// ComputeAllScenarioBuckets computes all bucket types for a loan using scenario data.
+// Uses fallback values (from amortization or default behaviour) when no scenario config matches.
+func ComputeAllScenarioBuckets(
+	sd *ScenarioData,
+	outstanding float64,
+	marketValue float64,
+	productType, ccy, segment, transactional string,
+	fallbackIRRBBP, fallbackIRRBBI map[string]float64,
+	fallbackLCRP, fallbackLCRI map[string]float64,
+	fallbackNSFRP, fallbackNSFRI map[string]float64,
+) (irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI map[string]float64) {
+
+	// IRRBB
+	if result, found := ComputeScenarioBucketsForType(sd, "IRRBB", IRRBBLabels, outstanding, marketValue, productType, ccy, segment, transactional); found {
+		irrbbP = result
+		irrbbI = EmptyBucketMap(IRRBBLabels) // scenario interest = 0
+	} else {
+		irrbbP = fallbackIRRBBP
+		irrbbI = fallbackIRRBBI
+	}
+
+	// LCR
+	if result, found := ComputeScenarioBucketsForType(sd, "LCR", LCRLabels, outstanding, marketValue, productType, ccy, segment, transactional); found {
+		lcrP = result
+		lcrI = EmptyBucketMap(LCRLabels)
+	} else {
+		lcrP = fallbackLCRP
+		lcrI = fallbackLCRI
+	}
+
+	// NSFR
+	if result, found := ComputeScenarioBucketsForType(sd, "NSFR", NSFRLabels, outstanding, marketValue, productType, ccy, segment, transactional); found {
+		nsfrP = result
+		nsfrI = EmptyBucketMap(NSFRLabels)
+	} else {
+		nsfrP = fallbackNSFRP
+		nsfrI = fallbackNSFRI
+	}
+
+	return
+}
+
+// LoadScenarioData loads bucket configs and cashflow assumptions for a behaviour from DB
+func LoadScenarioData(behaviourID int64) *ScenarioData {
+	sd := &ScenarioData{}
+
+	// Load bucket configs
 	rows, err := config.DB.Query(
-		`SELECT sm.behaviour_id, b.name
-		 FROM scenario_mappings sm
-		 JOIN behaviours b ON b.id = sm.behaviour_id
-		 WHERE sm.upload_id = $1
-		   AND (sm.product_type = '' OR sm.product_type = $2)
-		   AND (sm.ccy = '' OR sm.ccy = $3)
-		   AND (sm.segment = '' OR sm.segment = $4)
-		   AND (sm.transactional = '' OR sm.transactional = $5)`,
-		uploadID, productType, ccy, segment, transactional,
+		`SELECT bucket_type, bucket_name, percentage, 
+		        COALESCE(product_type, ''), COALESCE(ccy, ''), 
+		        COALESCE(segment, ''), COALESCE(transactional, ''),
+		        COALESCE(value_type, 'Outstanding')
+		 FROM scenario_bucket_configs WHERE behaviour_id = $1`,
+		behaviourID,
 	)
 	if err != nil {
-		log.Printf("Failed to get matching behaviours: %v", err)
-		return nil
+		log.Printf("Failed to load scenario bucket configs for %d: %v", behaviourID, err)
+		return sd
 	}
 	defer rows.Close()
 
-	var results []struct {
-		BehaviourID   int64
-		BehaviourName string
+	// Build grouped configs
+	type configKey struct {
+		ProductType   string
+		CCY           string
+		Segment       string
+		Transactional string
+		ValueType     string
+		BucketType    string
 	}
+	configMap := make(map[configKey]*ScenarioBucketConfig)
+
 	for rows.Next() {
-		var r struct {
-			BehaviourID   int64
-			BehaviourName string
+		var bucketType, bucketName string
+		var pct float64
+		var pt, ccy, seg, trans, vt string
+		if rows.Scan(&bucketType, &bucketName, &pct, &pt, &ccy, &seg, &trans, &vt) != nil {
+			continue
 		}
-		if rows.Scan(&r.BehaviourID, &r.BehaviourName) == nil {
-			results = append(results, r)
+
+		key := configKey{pt, ccy, seg, trans, vt, bucketType}
+		if configMap[key] == nil {
+			configMap[key] = &ScenarioBucketConfig{
+				ProductType:   pt,
+				CCY:           ccy,
+				Segment:       seg,
+				Transactional: trans,
+				ValueType:     vt,
+				BucketType:    bucketType,
+				Config:        make(map[string]float64),
+			}
+		}
+		configMap[key].Config[bucketName] = pct
+	}
+
+	for _, cfg := range configMap {
+		sd.BucketConfigs = append(sd.BucketConfigs, *cfg)
+	}
+
+	// Load cashflow assumptions
+	rows2, err := config.DB.Query(
+		`SELECT COALESCE(product_type, ''), COALESCE(ccy, ''), 
+		        COALESCE(segment, ''), COALESCE(transactional, ''),
+		        bucket_type, percentage
+		 FROM scenario_cashflow_assumptions WHERE behaviour_id = $1`,
+		behaviourID,
+	)
+	if err != nil {
+		log.Printf("Failed to load cashflow assumptions for %d: %v", behaviourID, err)
+		return sd
+	}
+	defer rows2.Close()
+
+	for rows2.Next() {
+		var ca ScenarioCashflowAssumption
+		if rows2.Scan(&ca.ProductType, &ca.CCY, &ca.Segment, &ca.Transactional, &ca.BucketType, &ca.Percentage) == nil {
+			sd.CashflowAssumptions = append(sd.CashflowAssumptions, ca)
 		}
 	}
 
-	return results
+	return sd
 }
