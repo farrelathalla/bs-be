@@ -309,35 +309,9 @@ func GetFilterOptions(c *gin.Context) {
 	uploadID := c.Param("id")
 	column := c.Query("column")
 
-	// Special case: result_type lives in cashflow_results, not loan_inputs
-	if column == "result_type" {
-		rows, err := config.DB.Query(
-			"SELECT DISTINCT result_type FROM cashflow_results WHERE upload_id = $1 AND result_type IS NOT NULL ORDER BY result_type",
-			uploadID,
-		)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to query"})
-			return
-		}
-		defer rows.Close()
-
-		var values []string
-		for rows.Next() {
-			var v string
-			if rows.Scan(&v) == nil {
-				values = append(values, v)
-			}
-		}
-		if values == nil {
-			values = []string{}
-		}
-		c.JSON(http.StatusOK, values)
-		return
-	}
-
-	validCols := map[string]string{
-		"ccy":                          "ccy",
-		"segment":                      "segment",
+	validInputCols := map[string]string{
+		"ccy":                        "ccy",
+		"segment":                    "segment",
 		"product_type":                 "product_type",
 		"daerah":                       "daerah",
 		"method":                       "method",
@@ -355,20 +329,30 @@ func GetFilterOptions(c *gin.Context) {
 		"interest_payment_frequency":   "interest_payment_frequency::text",
 	}
 
-	dbCol, ok := validCols[column]
-	if !ok {
+	validResultCols := map[string]string{
+		"result_type":    "result_type",
+		"remaining_days": "remaining_days::text",
+	}
+
+	var query string
+	if dbCol, ok := validInputCols[column]; ok {
+		query = fmt.Sprintf(
+			"SELECT DISTINCT %s FROM loan_inputs WHERE upload_id = $1 AND %s IS NOT NULL ORDER BY %s",
+			dbCol, dbCol, dbCol,
+		)
+	} else if dbCol, ok := validResultCols[column]; ok {
+		query = fmt.Sprintf(
+			"SELECT DISTINCT %s FROM cashflow_results WHERE upload_id = $1 AND %s IS NOT NULL ORDER BY %s",
+			dbCol, dbCol, dbCol,
+		)
+	} else {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid column"})
 		return
 	}
 
-	query := fmt.Sprintf(
-		"SELECT DISTINCT %s FROM loan_inputs WHERE upload_id = $1 AND %s IS NOT NULL ORDER BY %s",
-		dbCol, dbCol, dbCol,
-	)
-
 	rows, err := config.DB.Query(query, uploadID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to query"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to query values"})
 		return
 	}
 	defer rows.Close()
