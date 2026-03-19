@@ -58,20 +58,20 @@ func GetPivot(c *gin.Context) {
 	}
 
 	// Parse filters
-	var filters map[string]string
+	var filters map[string]interface{}
 	json.Unmarshal([]byte(filtersJSON), &filters)
 
 	filterColMap := map[string]string{
-		"ccy":                    "li.ccy",
-		"segment":                "li.segment",
-		"product_type":           "li.product_type",
-		"daerah":                 "li.daerah",
-		"method":                 "li.method",
-		"insured_or_uninsured":   "li.insured_or_uninsured",
-		"transactional_or_non":   "li.transactional_or_non",
-		"kode_pos":               "li.kode_pos",
-		"account_id":             "li.account_id",
-		"result_type":            "cr.result_type",
+		"ccy":                  "li.ccy",
+		"segment":              "li.segment",
+		"product_type":         "li.product_type",
+		"daerah":               "li.daerah",
+		"method":               "li.method",
+		"insured_or_uninsured": "li.insured_or_uninsured",
+		"transactional_or_non": "li.transactional_or_non",
+		"kode_pos":             "li.kode_pos",
+		"account_id":           "li.account_id",
+		"result_type":          "cr.result_type",
 	}
 
 	whereClause := "li.upload_id = $1"
@@ -79,10 +79,28 @@ func GetPivot(c *gin.Context) {
 	argIdx := 2
 
 	for filterKey, filterVal := range filters {
-		if dbCol, valid := filterColMap[filterKey]; valid && filterVal != "" {
-			whereClause += fmt.Sprintf(" AND %s = $%d", dbCol, argIdx)
-			args = append(args, filterVal)
-			argIdx++
+		if dbCol, valid := filterColMap[filterKey]; valid {
+			switch v := filterVal.(type) {
+			case string:
+				if v != "" {
+					whereClause += fmt.Sprintf(" AND %s = $%d", dbCol, argIdx)
+					args = append(args, v)
+					argIdx++
+				}
+			case []interface{}: // JSON arrays unmarshal to []interface{}
+				if len(v) > 0 {
+					whereClause += fmt.Sprintf(" AND %s = ANY($%d)", dbCol, argIdx)
+					// Convert []interface{} to string array
+					strArr := make([]string, 0, len(v))
+					for _, item := range v {
+						if s, ok := item.(string); ok {
+							strArr = append(strArr, s)
+						}
+					}
+					args = append(args, strArr)
+					argIdx++
+				}
+			}
 		}
 	}
 
