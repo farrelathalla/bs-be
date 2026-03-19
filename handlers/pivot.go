@@ -377,6 +377,7 @@ func GetSummary(c *gin.Context) {
 	uploadID := c.Param("id")
 	filterType := c.DefaultQuery("filter_type", "both")
 	filtersJSON := c.DefaultQuery("filters", "{}")
+	behaviourID := c.Query("behaviour_id")
 
 	var filters map[string]string
 	json.Unmarshal([]byte(filtersJSON), &filters)
@@ -397,6 +398,15 @@ func GetSummary(c *gin.Context) {
 	args := []interface{}{uploadID}
 	argIdx := 2
 
+	// Behaviour filter (must join cashflow_results)
+	if behaviourID != "" && behaviourID != "null" && behaviourID != "base" {
+		whereClause += fmt.Sprintf(" AND cr.behaviour_id = $%d", argIdx)
+		args = append(args, behaviourID)
+		argIdx++
+	} else {
+		whereClause += " AND cr.behaviour_id IS NULL"
+	}
+
 	for filterKey, filterVal := range filters {
 		if dbCol, valid := filterColMap[filterKey]; valid && filterVal != "" {
 			whereClause += fmt.Sprintf(" AND %s = $%d", dbCol, argIdx)
@@ -405,17 +415,28 @@ func GetSummary(c *gin.Context) {
 		}
 	}
 
-	// Get aggregate sums
+	// Get aggregate sums — join with cashflow_results for behaviour filter
 	var totalCount int
 	var totalOutstanding float64
+	var totalInterestRate float64
 
 	config.DB.QueryRow(
-		fmt.Sprintf("SELECT COUNT(*), COALESCE(SUM(li.outstanding), 0) FROM loan_inputs li WHERE %s", whereClause),
+		fmt.Sprintf(`SELECT COUNT(*), COALESCE(SUM(li.outstanding), 0), COALESCE(SUM(li.interest_rate), 0)
+		 FROM loan_inputs li
+		 JOIN cashflow_results cr ON cr.loan_input_id = li.id
+		 WHERE %s`, whereClause),
 		args...,
-	).Scan(&totalCount, &totalOutstanding)
+	).Scan(&totalCount, &totalOutstanding, &totalInterestRate)
+
+	avgInterestRate := 0.0
+	if totalCount > 0 {
+		avgInterestRate = totalInterestRate / float64(totalCount)
+	}
 
 	// Get unique currencies
-	currQuery := fmt.Sprintf("SELECT DISTINCT li.ccy FROM loan_inputs li WHERE %s ORDER BY li.ccy", whereClause)
+	currQuery := fmt.Sprintf(`SELECT DISTINCT li.ccy FROM loan_inputs li
+		 JOIN cashflow_results cr ON cr.loan_input_id = li.id
+		 WHERE %s ORDER BY li.ccy`, whereClause)
 	currRows, _ := config.DB.Query(currQuery, args...)
 	var currencies []string
 	if currRows != nil {
@@ -466,10 +487,19 @@ func GetSummary(c *gin.Context) {
 
 	bucketTotals := buildAggregates(aggIrrbbP, aggIrrbbI, aggLcrP, aggLcrI, aggNsfrP, aggNsfrI, filterType)
 
+	// Build column_sums: include outstanding and all bucket totals
+	columnSums := make(map[string]float64)
+	columnSums["outstanding"] = calculator.Round2(totalOutstanding)
+	for k, v := range bucketTotals {
+		columnSums[k] = v
+	}
+
 	c.JSON(http.StatusOK, gin.H{
-		"total_count":      totalCount,
+		"total_count":       totalCount,
 		"total_outstanding": calculator.Round2(totalOutstanding),
-		"currencies":       currencies,
-		"bucket_totals":    bucketTotals,
+		"avg_interest_rate": avgInterestRate,
+		"currencies":        currencies,
+		"bucket_totals":     bucketTotals,
+		"column_sums":       columnSums,
 	})
 }

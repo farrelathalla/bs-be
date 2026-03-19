@@ -86,6 +86,17 @@ func SeedReferenceData() {
 			{"2", "Floating"},
 			{"3", "Nonmaturing"},
 		},
+		"transactional_types": {
+			{"1", "Transactional"},
+			{"2", "Non Transactional"},
+		},
+		"installment_frequencies": {
+			{"1", "Monthly"},
+			{"2", "Bi-Monthly"},
+			{"3", "Quarterly"},
+			{"6", "Semi-Annual"},
+			{"12", "Annual"},
+		},
 	}
 
 	for table, items := range refs {

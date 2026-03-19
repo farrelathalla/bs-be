@@ -234,7 +234,7 @@ func processBatch(uploadID string, loans []models.Loan, startIdx int, defaultWei
 			schedule := calculator.GenerateSchedule(&loan)
 			irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI = calculator.ComputeAllBuckets(schedule, loan.ReportingDate)
 			remainingDays = loan.TenorDays()
-			baseResultType = "Amortization"
+			baseResultType = "Contractual"
 		} else {
 			if defaultWeights != nil {
 				irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI = calculator.ComputeBehaviourBuckets(loan.Outstanding, defaultWeights)
@@ -424,7 +424,7 @@ func reprocessBatch(uploadID string, loanRows []loanWithID, defaultWeights calcu
 			schedule := calculator.GenerateSchedule(&loan)
 			irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI = calculator.ComputeAllBuckets(schedule, loan.ReportingDate)
 			remainingDays = loan.TenorDays()
-			baseResultType = "Amortization"
+			baseResultType = "Contractual"
 		} else {
 			if defaultWeights != nil {
 				irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI = calculator.ComputeBehaviourBuckets(loan.Outstanding, defaultWeights)

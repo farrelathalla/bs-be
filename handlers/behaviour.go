@@ -43,6 +43,13 @@ func UploadBehaviour(c *gin.Context) {
 		return
 	}
 
+	// Validate no overlapping rules between Bucket and Cashflow Assumption
+	overlapErrors := validateScenarioCSV(bucketConfigs, cashflowAssumptions)
+	if len(overlapErrors) > 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Overlapping rules detected", "details": overlapErrors})
+		return
+	}
+
 	// Check upload exists
 	var exists int
 	config.DB.QueryRow("SELECT COUNT(*) FROM uploads WHERE id = $1", uploadID).Scan(&exists)
@@ -227,6 +234,13 @@ func UpdateBehaviour(c *gin.Context) {
 		bucketConfigs, cashflowAssumptions, parseErrors := parseScenarioCSV(content)
 		if len(parseErrors) > 0 {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "CSV parsing errors", "details": parseErrors})
+			return
+		}
+
+		// Validate no overlapping rules
+		overlapErrors := validateScenarioCSV(bucketConfigs, cashflowAssumptions)
+		if len(overlapErrors) > 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Overlapping rules detected", "details": overlapErrors})
 			return
 		}
 
@@ -458,3 +472,105 @@ func parseScenarioCSV(content []byte) ([]bucketConfigInternal, []cashflowAssumpt
 
 	return bucketConfigs, cashflowAssumptions, errors
 }
+
+// ──────────────────────────────────────────────────────────────
+//  Overlap Validator (mirrors installment_software/validator.py)
+// ──────────────────────────────────────────────────────────────
+
+// valuesOverlap returns true if two values overlap.
+// "All" (case-insensitive) is a wildcard that matches anything.
+// Empty strings also act as wildcards (match everything).
+func valuesOverlap(a, b string) bool {
+	aNorm := strings.ToLower(strings.TrimSpace(a))
+	bNorm := strings.ToLower(strings.TrimSpace(b))
+	if aNorm == "" || bNorm == "" {
+		return true
+	}
+	return aNorm == "all" || bNorm == "all" || aNorm == bNorm
+}
+
+// formatOverlapPair shows which keys overlap, highlighting where "All" matched a specific value
+func formatOverlapPair(keysA, keysB []string, colNames []string) string {
+	parts := make([]string, 0, len(colNames))
+	for i, col := range colNames {
+		va, vb := keysA[i], keysB[i]
+		vaNorm := strings.ToLower(strings.TrimSpace(va))
+		vbNorm := strings.ToLower(strings.TrimSpace(vb))
+		if vaNorm == vbNorm {
+			parts = append(parts, fmt.Sprintf("%s='%s'", col, va))
+		} else {
+			parts = append(parts, fmt.Sprintf("%s=('%s' ↔ '%s')", col, va, vb))
+		}
+	}
+	return strings.Join(parts, ", ")
+}
+
+// validateScenarioCSV checks for overlapping rules within bucket configs,
+// within cashflow assumptions, and across both sections.
+// Returns a list of human-readable error strings (empty = valid).
+func validateScenarioCSV(buckets []bucketConfigInternal, cfs []cashflowAssumptionInternal) []string {
+	var errs []string
+
+	// ── 1. Bucket section: overlap on (BucketType, ProductType, CCY, Segment, Transactional) ──
+	bucketKeyCols := []string{"BucketType", "ProductType", "CCY", "Segment", "Transactional"}
+	for i := 0; i < len(buckets); i++ {
+		keysI := []string{buckets[i].BucketType, buckets[i].ProductType, buckets[i].CCY, buckets[i].Segment, buckets[i].Transactional}
+		for j := i + 1; j < len(buckets); j++ {
+			keysJ := []string{buckets[j].BucketType, buckets[j].ProductType, buckets[j].CCY, buckets[j].Segment, buckets[j].Transactional}
+			overlap := true
+			for k := range keysI {
+				if !valuesOverlap(keysI[k], keysJ[k]) {
+					overlap = false
+					break
+				}
+			}
+			if overlap {
+				desc := formatOverlapPair(keysI, keysJ, bucketKeyCols)
+				errs = append(errs, fmt.Sprintf("[Bucket] Overlapping rule at rows %d and %d: %s", i+2, j+2, desc))
+			}
+		}
+	}
+
+	// ── 2. Cashflow Assumption section: overlap on (ProductType, CCY, Segment, Transactional, BucketType) ──
+	cfKeyCols := []string{"ProductType", "CCY", "Segment", "Transactional", "BucketType"}
+	for i := 0; i < len(cfs); i++ {
+		keysI := []string{cfs[i].ProductType, cfs[i].CCY, cfs[i].Segment, cfs[i].Transactional, cfs[i].BucketType}
+		for j := i + 1; j < len(cfs); j++ {
+			keysJ := []string{cfs[j].ProductType, cfs[j].CCY, cfs[j].Segment, cfs[j].Transactional, cfs[j].BucketType}
+			overlap := true
+			for k := range keysI {
+				if !valuesOverlap(keysI[k], keysJ[k]) {
+					overlap = false
+					break
+				}
+			}
+			if overlap {
+				desc := formatOverlapPair(keysI, keysJ, cfKeyCols)
+				errs = append(errs, fmt.Sprintf("[Cashflow Assumption] Overlapping rule at rows %d and %d: %s", i+2, j+2, desc))
+			}
+		}
+	}
+
+	// ── 3. Cross-section: Bucket × Cashflow Assumption on (BucketType, ProductType, CCY, Segment, Transactional) ──
+	crossKeyCols := []string{"BucketType", "ProductType", "CCY", "Segment", "Transactional"}
+	for i, b := range buckets {
+		keysB := []string{b.BucketType, b.ProductType, b.CCY, b.Segment, b.Transactional}
+		for j, cf := range cfs {
+			keysCF := []string{cf.BucketType, cf.ProductType, cf.CCY, cf.Segment, cf.Transactional}
+			overlap := true
+			for k := range keysB {
+				if !valuesOverlap(keysB[k], keysCF[k]) {
+					overlap = false
+					break
+				}
+			}
+			if overlap {
+				desc := formatOverlapPair(keysB, keysCF, crossKeyCols)
+				errs = append(errs, fmt.Sprintf("[Cross-Sheet] Bucket row %d overlaps with Cashflow Assumption row %d: %s", i+2, j+2, desc))
+			}
+		}
+	}
+
+	return errs
+}
+

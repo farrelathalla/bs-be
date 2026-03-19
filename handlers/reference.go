@@ -12,12 +12,48 @@ import (
 
 // validRefTables whitelist of allowed reference table names
 var validRefTables = map[string]bool{
-	"product_types":   true,
-	"segments":        true,
-	"methods":         true,
-	"day_counts":      true,
-	"currencies":      true,
-	"instrument_types": true,
+	"product_types":          true,
+	"segments":               true,
+	"methods":                true,
+	"day_counts":             true,
+	"currencies":             true,
+	"instrument_types":       true,
+	"transactional_types":    true,
+	"installment_frequencies": true,
+}
+
+// allRefTableNames is the ordered list for GetAllReferenceMaps
+var allRefTableNames = []string{
+	"product_types", "segments", "methods", "day_counts",
+	"currencies", "instrument_types", "transactional_types", "installment_frequencies",
+}
+
+// GetAllReferenceMaps returns all reference tables as a single JSON object
+// Accessible by all authenticated users (not just superadmin)
+func GetAllReferenceMaps(c *gin.Context) {
+	result := make(map[string][]models.ReferenceItem)
+
+	for _, table := range allRefTableNames {
+		rows, err := config.DB.Query(
+			fmt.Sprintf("SELECT id, name FROM %s ORDER BY id", table),
+		)
+		if err != nil {
+			result[table] = []models.ReferenceItem{}
+			continue
+		}
+
+		items := make([]models.ReferenceItem, 0)
+		for rows.Next() {
+			var item models.ReferenceItem
+			if rows.Scan(&item.ID, &item.Name) == nil {
+				items = append(items, item)
+			}
+		}
+		rows.Close()
+		result[table] = items
+	}
+
+	c.JSON(http.StatusOK, result)
 }
 
 // ListReference returns all items from a reference table

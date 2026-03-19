@@ -21,6 +21,8 @@ func runMigrations(db *sql.DB) {
 		"migrations/004_behaviours.sql",
 		"migrations/005_scenarios.sql",
 		"migrations/006_revision.sql",
+		"migrations/007_additional_refs.sql",
+		"migrations/008_presets.sql",
 	}
 
 	for _, f := range migrationFiles {
@@ -97,6 +99,15 @@ func main() {
 
 		// Pivot
 		auth.GET("/pivot/:id", handlers.GetPivot)
+
+		// Reference maps (all users can read)
+		auth.GET("/reference-maps", handlers.GetAllReferenceMaps)
+
+		// Presets
+		auth.GET("/presets", handlers.ListPresets)
+		auth.POST("/presets", handlers.CreatePreset)
+		auth.PUT("/presets/:id", handlers.UpdatePreset)
+		auth.DELETE("/presets/:id", handlers.DeletePreset)
 
 		// Export
 		auth.GET("/export/:id", handlers.ExportExcel)
