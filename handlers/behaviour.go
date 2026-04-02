@@ -1,10 +1,12 @@
 package handlers
 
 import (
+	"bytes"
 	"encoding/csv"
 	"fmt"
 	"io"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -12,9 +14,10 @@ import (
 	"bs-be/models"
 
 	"github.com/gin-gonic/gin"
+	"github.com/xuri/excelize/v2"
 )
 
-// UploadBehaviour parses a scenario/behaviour CSV and saves it
+// UploadBehaviour parses a scenario/behaviour CSV or XLSX and saves it
 func UploadBehaviour(c *gin.Context) {
 	uploadID := c.Param("id")
 	name := c.PostForm("name")
@@ -23,7 +26,7 @@ func UploadBehaviour(c *gin.Context) {
 		return
 	}
 
-	file, _, err := c.Request.FormFile("file")
+	file, header, err := c.Request.FormFile("file")
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "No file uploaded"})
 		return
@@ -36,10 +39,19 @@ func UploadBehaviour(c *gin.Context) {
 		return
 	}
 
-	// Parse CSV (2-section format)
-	bucketConfigs, cashflowAssumptions, parseErrors := parseScenarioCSV(content)
+	// Detect file type and parse accordingly
+	var bucketConfigs []bucketConfigInternal
+	var cashflowAssumptions []cashflowAssumptionInternal
+	var parseErrors []string
+
+	ext := strings.ToLower(filepath.Ext(header.Filename))
+	if ext == ".xlsx" || ext == ".xls" {
+		bucketConfigs, cashflowAssumptions, parseErrors = parseScenarioXLSX(content)
+	} else {
+		bucketConfigs, cashflowAssumptions, parseErrors = parseScenarioCSV(content)
+	}
 	if len(parseErrors) > 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "CSV parsing errors", "details": parseErrors})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "File parsing errors", "details": parseErrors})
 		return
 	}
 
@@ -220,8 +232,8 @@ func UpdateBehaviour(c *gin.Context) {
 		tx.Exec("UPDATE behaviours SET name = $1, updated_at = NOW() WHERE id = $2", name, id)
 	}
 
-	// Re-upload CSV if provided
-	file, _, fileErr := c.Request.FormFile("file")
+	// Re-upload file if provided
+	file, fileHeader, fileErr := c.Request.FormFile("file")
 	if fileErr == nil {
 		defer file.Close()
 		content, err := io.ReadAll(file)
@@ -230,10 +242,19 @@ func UpdateBehaviour(c *gin.Context) {
 			return
 		}
 
-		// Parse CSV
-		bucketConfigs, cashflowAssumptions, parseErrors := parseScenarioCSV(content)
+		// Detect file type and parse
+		var bucketConfigs []bucketConfigInternal
+		var cashflowAssumptions []cashflowAssumptionInternal
+		var parseErrors []string
+
+		ext := strings.ToLower(filepath.Ext(fileHeader.Filename))
+		if ext == ".xlsx" || ext == ".xls" {
+			bucketConfigs, cashflowAssumptions, parseErrors = parseScenarioXLSX(content)
+		} else {
+			bucketConfigs, cashflowAssumptions, parseErrors = parseScenarioCSV(content)
+		}
 		if len(parseErrors) > 0 {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "CSV parsing errors", "details": parseErrors})
+			c.JSON(http.StatusBadRequest, gin.H{"error": "File parsing errors", "details": parseErrors})
 			return
 		}
 
@@ -479,13 +500,10 @@ func parseScenarioCSV(content []byte) ([]bucketConfigInternal, []cashflowAssumpt
 
 // valuesOverlap returns true if two values overlap.
 // "All" (case-insensitive) is a wildcard that matches anything.
-// Empty strings also act as wildcards (match everything).
+// Matches Python validator.py: only "All" is a wildcard, NOT empty strings.
 func valuesOverlap(a, b string) bool {
 	aNorm := strings.ToLower(strings.TrimSpace(a))
 	bNorm := strings.ToLower(strings.TrimSpace(b))
-	if aNorm == "" || bNorm == "" {
-		return true
-	}
 	return aNorm == "all" || bNorm == "all" || aNorm == bNorm
 }
 
@@ -510,6 +528,27 @@ func formatOverlapPair(keysA, keysB []string, colNames []string) string {
 // Returns a list of human-readable error strings (empty = valid).
 func validateScenarioCSV(buckets []bucketConfigInternal, cfs []cashflowAssumptionInternal) []string {
 	var errs []string
+
+	// ── 0. Exact duplicate detection (matches Python validator.py) ──
+	type dupKey struct {
+		BucketType, BucketName, ProductType, CCY, Segment, Transactional string
+	}
+	dupSeen := make(map[dupKey]int) // key → first row (1-based data row)
+	for i, b := range buckets {
+		k := dupKey{
+			strings.ToLower(strings.TrimSpace(b.BucketType)),
+			strings.ToLower(strings.TrimSpace(b.BucketName)),
+			strings.ToLower(strings.TrimSpace(b.ProductType)),
+			strings.ToLower(strings.TrimSpace(b.CCY)),
+			strings.ToLower(strings.TrimSpace(b.Segment)),
+			strings.ToLower(strings.TrimSpace(b.Transactional)),
+		}
+		if firstRow, exists := dupSeen[k]; exists {
+			errs = append(errs, fmt.Sprintf("[Bucket] Duplicate row at rows %d and %d", firstRow, i+2))
+		} else {
+			dupSeen[k] = i + 2
+		}
+	}
 
 	// ── 1. Bucket section: overlap on (BucketType, ProductType, CCY, Segment, Transactional) ──
 	bucketKeyCols := []string{"BucketType", "ProductType", "CCY", "Segment", "Transactional"}
@@ -574,3 +613,134 @@ func validateScenarioCSV(buckets []bucketConfigInternal, cfs []cashflowAssumptio
 	return errs
 }
 
+// parseScenarioXLSX parses a scenario XLSX file with "Bucket" and "Cashflow Assumption" sheets.
+// Mirrors the Python scenario.py Excel reader.
+func parseScenarioXLSX(content []byte) ([]bucketConfigInternal, []cashflowAssumptionInternal, []string) {
+	var errors []string
+
+	f, err := excelize.OpenReader(bytes.NewReader(content))
+	if err != nil {
+		errors = append(errors, "Failed to open XLSX file: "+err.Error())
+		return nil, nil, errors
+	}
+	defer f.Close()
+
+	// Find sheets (case-insensitive)
+	var bucketSheet, cfSheet string
+	for _, name := range f.GetSheetList() {
+		lower := strings.ToLower(strings.TrimSpace(name))
+		if lower == "bucket" {
+			bucketSheet = name
+		} else if lower == "cashflow assumption" {
+			cfSheet = name
+		}
+	}
+
+	if bucketSheet == "" {
+		errors = append(errors, "Sheet 'Bucket' not found in XLSX file")
+	}
+	if cfSheet == "" {
+		errors = append(errors, "Sheet 'Cashflow Assumption' not found in XLSX file")
+	}
+	if len(errors) > 0 {
+		return nil, nil, errors
+	}
+
+	// Parse Bucket sheet
+	var bucketConfigs []bucketConfigInternal
+	bucketRows, err := f.GetRows(bucketSheet)
+	if err == nil && len(bucketRows) > 1 {
+		header := bucketRows[0]
+		colMap := make(map[string]int)
+		for i, h := range header {
+			colMap[strings.ToLower(strings.TrimSpace(h))] = i
+		}
+
+		for _, row := range bucketRows[1:] {
+			getVal := func(key string) string {
+				idx, ok := colMap[key]
+				if !ok || idx >= len(row) {
+					return ""
+				}
+				return strings.TrimSpace(row[idx])
+			}
+
+			b := bucketConfigInternal{ValueType: "Outstanding"}
+			b.BucketType = getVal("bucket type")
+			b.BucketName = getVal("bucket name")
+
+			// Parse percentage
+			pStr := getVal("percentage")
+			if pStr != "" {
+				pStr = strings.TrimSuffix(pStr, "%")
+				p, _ := strconv.ParseFloat(pStr, 64)
+				if p > 1.0 {
+					p = p / 100.0
+				}
+				b.Percentage = p
+			}
+
+			b.ProductType = getVal("producttype")
+			b.CCY = getVal("ccy")
+			b.Segment = getVal("segment")
+			b.Transactional = getVal("transactional/non transactional")
+
+			vt := getVal("value type")
+			if vt != "" {
+				b.ValueType = vt
+			}
+
+			// Convert numeric IDs to names for matching (Excel may have "2" for Deposit)
+			// These stay as strings — the scenario matching uses string comparison
+
+			if b.BucketType != "" && b.BucketName != "" {
+				bucketConfigs = append(bucketConfigs, b)
+			}
+		}
+	}
+
+	// Parse Cashflow Assumption sheet
+	var cashflowAssumptions []cashflowAssumptionInternal
+	cfRows, err := f.GetRows(cfSheet)
+	if err == nil && len(cfRows) > 1 {
+		header := cfRows[0]
+		colMap := make(map[string]int)
+		for i, h := range header {
+			colMap[strings.ToLower(strings.TrimSpace(h))] = i
+		}
+
+		for _, row := range cfRows[1:] {
+			getVal := func(key string) string {
+				idx, ok := colMap[key]
+				if !ok || idx >= len(row) {
+					return ""
+				}
+				return strings.TrimSpace(row[idx])
+			}
+
+			ca := cashflowAssumptionInternal{Percentage: 1.0}
+			ca.ProductType = getVal("producttype")
+			ca.CCY = getVal("ccy")
+			ca.Segment = getVal("segment")
+			ca.Transactional = getVal("transactional/non transactional")
+			ca.BucketType = getVal("bucket type")
+
+			// Parse cashflow assumption percentage
+			pStr := getVal("cashflow assumption")
+			if pStr != "" {
+				pStr = strings.TrimSuffix(pStr, "%")
+				p, _ := strconv.ParseFloat(pStr, 64)
+				if p > 1.0 {
+					p = p / 100.0
+				}
+				ca.Percentage = p
+			}
+
+			if ca.BucketType != "" {
+				cashflowAssumptions = append(cashflowAssumptions, ca)
+			}
+		}
+	}
+
+	return bucketConfigs, cashflowAssumptions, errors
+}

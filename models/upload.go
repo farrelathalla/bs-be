@@ -22,46 +22,56 @@ type User struct {
 
 // CashflowResult holds computed bucket values for a single loan
 type CashflowResult struct {
-	ID            int64              `json:"id"`
-	UploadID      string             `json:"upload_id"`
-	LoanInputID   int64              `json:"loan_input_id"`
-	RemainingDays int                `json:"remaining_days"`
+	ID             int64              `json:"id"`
+	UploadID       string             `json:"upload_id"`
+	LoanInputID    int64              `json:"loan_input_id"`
+	RemainingDays  int                `json:"remaining_days"`
 	IRRBBPrincipal map[string]float64 `json:"irrbb_principal"`
 	IRRBBInterest  map[string]float64 `json:"irrbb_interest"`
 	LCRPrincipal   map[string]float64 `json:"lcr_principal"`
 	LCRInterest    map[string]float64 `json:"lcr_interest"`
 	NSFRPrincipal  map[string]float64 `json:"nsfr_principal"`
 	NSFRInterest   map[string]float64 `json:"nsfr_interest"`
+	ILAAPPrincipal map[string]float64 `json:"ilaap_principal"`
+	ILAAPInterest  map[string]float64 `json:"ilaap_interest"`
 }
 
 // ResultRow is a combined loan input + cashflow result for API response
 type ResultRow struct {
-	RowNumber              int                `json:"row_number"`
-	ReportingDate          string             `json:"reporting_date"`
-	AccountID              string             `json:"account_id"`
-	CCY                    string             `json:"ccy"`
-	Outstanding            float64            `json:"outstanding"`
-	InterestRate           float64            `json:"interest_rate"`
-	StartDate              string             `json:"start_date"`
-	EndDate                string             `json:"end_date"`
-	InstallmentFrequency   *int               `json:"installment_frequency"`
-	ProductType            string             `json:"product_type"`
-	Segment                string             `json:"segment"`
-	Daerah                 string             `json:"daerah"`
-	KodePos                string             `json:"kode_pos"`
-	InsuredOrUninsured     string             `json:"insured_or_uninsured"`
-	TransactionalOrNon     string             `json:"transactional_or_non"`
-	Method                 string             `json:"method"`
-	InterestPaymentFrequency *int             `json:"interest_payment_frequency"`
-	DayCount               string             `json:"day_count"`
-	RemainingDays          int                `json:"remaining_days"`
-	ResultType             string             `json:"result_type"`
-	IRRBBPrincipal         map[string]float64 `json:"irrbb_principal"`
-	IRRBBInterest          map[string]float64 `json:"irrbb_interest"`
-	LCRPrincipal           map[string]float64 `json:"lcr_principal"`
-	LCRInterest            map[string]float64 `json:"lcr_interest"`
-	NSFRPrincipal          map[string]float64 `json:"nsfr_principal"`
-	NSFRInterest           map[string]float64 `json:"nsfr_interest"`
+	RowNumber                int                `json:"row_number"`
+	ReportingDate            string             `json:"reporting_date"`
+	AccountID                string             `json:"account_id"`
+	AccountNumber            string             `json:"account_number"`
+	CCY                      string             `json:"ccy"`
+	Outstanding              float64            `json:"outstanding"`
+	InterestRate             float64            `json:"interest_rate"`
+	StartDate                string             `json:"start_date"`
+	EndDate                  string             `json:"end_date"`
+	InstallmentFrequency     *int               `json:"installment_frequency"`
+	ProductType              string             `json:"product_type"`
+	Segment                  string             `json:"segment"`
+	Daerah                   string             `json:"daerah"`
+	KodePos                  string             `json:"kode_pos"`
+	InsuredOrUninsured       string             `json:"insured_or_uninsured"`
+	TransactionalOrNon       string             `json:"transactional_or_non"`
+	Method                   string             `json:"method"`
+	InterestPaymentFrequency *int               `json:"interest_payment_frequency"`
+	DayCount                 string             `json:"day_count"`
+	InstrumentType           string             `json:"instrument_type"`
+	MarketValue              float64            `json:"market_value"`
+	AssetLiability           int                `json:"asset_liability"`
+	Margin                   float64            `json:"margin"`
+	RevolvingFlag            string             `json:"revolving_flag"`
+	RemainingDays            int                `json:"remaining_days"`
+	ResultType               string             `json:"result_type"`
+	IRRBBPrincipal           map[string]float64 `json:"irrbb_principal"`
+	IRRBBInterest            map[string]float64 `json:"irrbb_interest"`
+	LCRPrincipal             map[string]float64 `json:"lcr_principal"`
+	LCRInterest              map[string]float64 `json:"lcr_interest"`
+	NSFRPrincipal            map[string]float64 `json:"nsfr_principal"`
+	NSFRInterest             map[string]float64 `json:"nsfr_interest"`
+	ILAAPPrincipal           map[string]float64 `json:"ilaap_principal"`
+	ILAAPInterest            map[string]float64 `json:"ilaap_interest"`
 }
 
 type PaginatedResponse struct {

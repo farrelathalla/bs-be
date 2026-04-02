@@ -51,9 +51,9 @@ func LoadDefaultBehaviourID() int64 {
 
 // ComputeBehaviourBuckets computes bucket values using behaviour weights
 // This applies to loans without end date (Default Behaviour) or custom scenarios
-// Returns: irrbbPrincipal, irrbbInterest, lcrPrincipal, lcrInterest, nsfrPrincipal, nsfrInterest
+// Returns: irrbbPrincipal, irrbbInterest, lcrPrincipal, lcrInterest, nsfrPrincipal, nsfrInterest, ilaapPrincipal, ilaapInterest
 func ComputeBehaviourBuckets(outstanding float64, weights BehaviourWeights) (
-	irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI map[string]float64,
+	irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI, ilaapP, ilaapI map[string]float64,
 ) {
 	irrbbP = EmptyBucketMap(IRRBBLabels)
 	irrbbI = EmptyBucketMap(IRRBBLabels)
@@ -61,6 +61,8 @@ func ComputeBehaviourBuckets(outstanding float64, weights BehaviourWeights) (
 	lcrI = EmptyBucketMap(LCRLabels)
 	nsfrP = EmptyBucketMap(NSFRLabels)
 	nsfrI = EmptyBucketMap(NSFRLabels)
+	ilaapP = EmptyBucketMap(ILAAPLabels)
+	ilaapI = EmptyBucketMap(ILAAPLabels)
 
 	if weights == nil {
 		return
@@ -89,6 +91,15 @@ func ComputeBehaviourBuckets(outstanding float64, weights BehaviourWeights) (
 		for label := range nsfrP {
 			if w, exists := nsfrWeights[label]; exists {
 				nsfrP[label] = Round2(outstanding * w)
+			}
+		}
+	}
+
+	// ILAAP — principal = outstanding * weight, interest = 0
+	if ilaapWeights, ok := weights["ILAAP"]; ok {
+		for label := range ilaapP {
+			if w, exists := ilaapWeights[label]; exists {
+				ilaapP[label] = Round2(outstanding * w)
 			}
 		}
 	}
@@ -175,11 +186,11 @@ func ComputeScenarioBucketsForType(
 
 	// Determine base value from Value Type
 	baseValue := outstanding
-	if cfg.ValueType == "Market" {
-		if marketValue > 0 {
+	if cfg.ValueType == "Market" || cfg.ValueType == "Market Value" {
+		if marketValue != 0 {
 			baseValue = marketValue
 		}
-		// if no market value, fallback to outstanding
+		// if no market value (0), fallback to outstanding
 	}
 
 	result := EmptyBucketMap(labels)
@@ -202,7 +213,8 @@ func ComputeAllScenarioBuckets(
 	fallbackIRRBBP, fallbackIRRBBI map[string]float64,
 	fallbackLCRP, fallbackLCRI map[string]float64,
 	fallbackNSFRP, fallbackNSFRI map[string]float64,
-) (irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI map[string]float64) {
+	fallbackILAAPP, fallbackILAAPI map[string]float64,
+) (irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI, ilaapP, ilaapI map[string]float64) {
 
 	// IRRBB
 	if result, found := ComputeScenarioBucketsForType(sd, "IRRBB", IRRBBLabels, outstanding, marketValue, productType, ccy, segment, transactional); found {
@@ -229,6 +241,15 @@ func ComputeAllScenarioBuckets(
 	} else {
 		nsfrP = fallbackNSFRP
 		nsfrI = fallbackNSFRI
+	}
+
+	// ILAAP
+	if result, found := ComputeScenarioBucketsForType(sd, "ILAAP", ILAAPLabels, outstanding, marketValue, productType, ccy, segment, transactional); found {
+		ilaapP = result
+		ilaapI = EmptyBucketMap(ILAAPLabels)
+	} else {
+		ilaapP = fallbackILAAPP
+		ilaapI = fallbackILAAPI
 	}
 
 	return

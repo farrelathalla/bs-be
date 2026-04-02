@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"bs-be/calculator"
@@ -44,8 +45,16 @@ func UploadCSV(c *gin.Context) {
 		return
 	}
 
-	// Validate CSV
-	loans, validationErrors := validator.ValidateAndParseCSV(bytes.NewReader(content), 50)
+	// Detect file type and parse accordingly
+	var loans []models.Loan
+	var validationErrors []models.ValidationError
+
+	ext := strings.ToLower(filepath.Ext(header.Filename))
+	if ext == ".xlsx" || ext == ".xls" {
+		loans, validationErrors = validator.ValidateAndParseXLSX(content, 50)
+	} else {
+		loans, validationErrors = validator.ValidateAndParseCSV(bytes.NewReader(content), 50)
+	}
 	if len(validationErrors) > 0 {
 		c.JSON(http.StatusBadRequest, models.UploadResponse{
 			Status: "failed",
@@ -160,7 +169,8 @@ func loadScenarios(uploadID string) []scenarioInfo {
 
 // insertResult is a helper that inserts a cashflow_results row
 func insertResult(tx *sql.Tx, uploadID string, loanInputID int64, remainingDays int,
-	irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI map[string]float64, resultType string, behaviourID *int64) error {
+	irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI, ilaapP, ilaapI map[string]float64,
+	resultType string, behaviourID *int64) error {
 
 	irrbbPJSON, _ := json.Marshal(irrbbP)
 	irrbbIJSON, _ := json.Marshal(irrbbI)
@@ -168,6 +178,8 @@ func insertResult(tx *sql.Tx, uploadID string, loanInputID int64, remainingDays 
 	lcrIJSON, _ := json.Marshal(lcrI)
 	nsfrPJSON, _ := json.Marshal(nsfrP)
 	nsfrIJSON, _ := json.Marshal(nsfrI)
+	ilaapPJSON, _ := json.Marshal(ilaapP)
+	ilaapIJSON, _ := json.Marshal(ilaapI)
 
 	_, err := tx.Exec(
 		`INSERT INTO cashflow_results (
@@ -175,13 +187,24 @@ func insertResult(tx *sql.Tx, uploadID string, loanInputID int64, remainingDays 
 			irrbb_principal, irrbb_interest,
 			lcr_principal, lcr_interest,
 			nsfr_principal, nsfr_interest,
+			ilaap_principal, ilaap_interest,
 			result_type, behaviour_id
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
 		uploadID, loanInputID, remainingDays,
 		irrbbPJSON, irrbbIJSON, lcrPJSON, lcrIJSON, nsfrPJSON, nsfrIJSON,
+		ilaapPJSON, ilaapIJSON,
 		resultType, behaviourID,
 	)
 	return err
+}
+
+// negateBucketMap negates all values in a bucket map (for liability sign flipping)
+func negateBucketMap(m map[string]float64) map[string]float64 {
+	result := make(map[string]float64, len(m))
+	for k, v := range m {
+		result[k] = -v
+	}
+	return result
 }
 
 func processBatch(uploadID string, loans []models.Loan, startIdx int, defaultWeights calculator.BehaviourWeights, scenarios []scenarioInfo) error {
@@ -202,42 +225,44 @@ func processBatch(uploadID string, loans []models.Loan, startIdx int, defaultWei
 			endDateSQL = nil
 		}
 
-		// Insert loan input
+		// Insert loan input (including new fields)
 		var loanInputID int64
 		err := tx.QueryRow(
 			`INSERT INTO loan_inputs (
-				upload_id, row_number, reporting_date, account_id, ccy, outstanding,
+				upload_id, row_number, reporting_date, account_id, account_number, ccy, outstanding,
 				interest_rate, start_date, end_date, installment_frequency,
 				product_type, segment, daerah, kode_pos, insured_or_uninsured,
 				transactional_or_non, method, interest_payment_frequency, day_count,
-				default_behaviour, instrument_type, market_value
-			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+				default_behaviour, instrument_type, market_value,
+				asset_liability, margin, revolving_flag
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
 			RETURNING id`,
 			uploadID, rowNum,
-			loan.ReportingDate, loan.AccountID, loan.CCY, loan.Outstanding,
+			loan.ReportingDate, loan.AccountID, loan.AccountNumber, loan.CCY, loan.Outstanding,
 			loan.InterestRate, loan.StartDate, endDateSQL, loan.InstallmentFrequency,
 			loan.ProductType, loan.Segment, loan.Daerah, loan.KodePos,
 			loan.InsuredOrUninsured, loan.TransactionalOrNon, loan.Method,
 			loan.InterestPaymentFrequency, loan.DayCount,
 			loan.DefaultBehaviour, loan.InstrumentType, loan.MarketValue,
+			loan.AssetLiability, loan.Margin, loan.RevolvingFlag,
 		).Scan(&loanInputID)
 		if err != nil {
 			return fmt.Errorf("failed to insert loan input row %d: %w", rowNum, err)
 		}
 
 		// ===== BASE RESULT (Amortization OR Default Behaviour) =====
-		var irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI map[string]float64
+		var irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI, ilaapP, ilaapI map[string]float64
 		var remainingDays int
 		var baseResultType string
 
 		if loan.HasEndDate() {
 			schedule := calculator.GenerateSchedule(&loan)
-			irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI = calculator.ComputeAllBuckets(schedule, loan.ReportingDate)
+			irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI, ilaapP, ilaapI = calculator.ComputeAllBuckets(schedule, loan.ReportingDate)
 			remainingDays = loan.TenorDays()
 			baseResultType = "Contractual"
 		} else {
 			if defaultWeights != nil {
-				irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI = calculator.ComputeBehaviourBuckets(loan.Outstanding, defaultWeights)
+				irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI, ilaapP, ilaapI = calculator.ComputeBehaviourBuckets(loan.Outstanding, defaultWeights)
 			} else {
 				irrbbP = calculator.EmptyBucketMap(calculator.IRRBBLabels)
 				irrbbI = calculator.EmptyBucketMap(calculator.IRRBBLabels)
@@ -245,29 +270,55 @@ func processBatch(uploadID string, loans []models.Loan, startIdx int, defaultWei
 				lcrI = calculator.EmptyBucketMap(calculator.LCRLabels)
 				nsfrP = calculator.EmptyBucketMap(calculator.NSFRLabels)
 				nsfrI = calculator.EmptyBucketMap(calculator.NSFRLabels)
+				ilaapP = calculator.EmptyBucketMap(calculator.ILAAPLabels)
+				ilaapI = calculator.EmptyBucketMap(calculator.ILAAPLabels)
 			}
 			remainingDays = 0
 			baseResultType = "Default Behaviour"
 		}
 
+		// Apply asset/liability sign flipping: liability (2) negates all values
+		if loan.AssetLiability == 2 {
+			irrbbP = negateBucketMap(irrbbP)
+			irrbbI = negateBucketMap(irrbbI)
+			lcrP = negateBucketMap(lcrP)
+			lcrI = negateBucketMap(lcrI)
+			nsfrP = negateBucketMap(nsfrP)
+			nsfrI = negateBucketMap(nsfrI)
+			ilaapP = negateBucketMap(ilaapP)
+			ilaapI = negateBucketMap(ilaapI)
+		}
+
 		if err := insertResult(tx, uploadID, loanInputID, remainingDays,
-			irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI, baseResultType, nil); err != nil {
+			irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI, ilaapP, ilaapI, baseResultType, nil); err != nil {
 			return fmt.Errorf("failed to insert base result row %d: %w", rowNum, err)
 		}
 
 		// ===== SCENARIO RESULTS =====
 		for _, sc := range scenarios {
-			scIrrbbP, scIrrbbI, scLcrP, scLcrI, scNsfrP, scNsfrI := calculator.ComputeAllScenarioBuckets(
+			scIrrbbP, scIrrbbI, scLcrP, scLcrI, scNsfrP, scNsfrI, scIlaapP, scIlaapI := calculator.ComputeAllScenarioBuckets(
 				sc.Data,
 				loan.Outstanding,
 				loan.MarketValue,
 				loan.ProductType, loan.CCY, loan.Segment, loan.TransactionalOrNon,
-				irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI, // fallback to base result
+				irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI, ilaapP, ilaapI, // fallback to base result
 			)
+
+			// Sign flipping already applied to fallback values; apply to scenario-computed values too
+			if loan.AssetLiability == 2 {
+				scIrrbbP = negateBucketMap(scIrrbbP)
+				scIrrbbI = negateBucketMap(scIrrbbI)
+				scLcrP = negateBucketMap(scLcrP)
+				scLcrI = negateBucketMap(scLcrI)
+				scNsfrP = negateBucketMap(scNsfrP)
+				scNsfrI = negateBucketMap(scNsfrI)
+				scIlaapP = negateBucketMap(scIlaapP)
+				scIlaapI = negateBucketMap(scIlaapI)
+			}
 
 			bid := sc.BehaviourID
 			if err := insertResult(tx, uploadID, loanInputID, remainingDays,
-				scIrrbbP, scIrrbbI, scLcrP, scLcrI, scNsfrP, scNsfrI, sc.BehaviourName, &bid); err != nil {
+				scIrrbbP, scIrrbbI, scLcrP, scLcrI, scNsfrP, scNsfrI, scIlaapP, scIlaapI, sc.BehaviourName, &bid); err != nil {
 				return fmt.Errorf("failed to insert scenario '%s' result row %d: %w", sc.BehaviourName, rowNum, err)
 			}
 		}
@@ -301,13 +352,14 @@ func ReprocessUpload(c *gin.Context) {
 
 	// Re-read existing loan_inputs WITH their IDs (DO NOT re-insert them)
 	rows, err := config.DB.Query(
-		`SELECT id, reporting_date, account_id, ccy, outstanding, interest_rate,
+		`SELECT id, reporting_date, account_id, COALESCE(account_number, ''), ccy, outstanding, interest_rate,
 		        start_date, end_date, installment_frequency,
 		        product_type, segment, daerah, kode_pos,
 		        insured_or_uninsured, transactional_or_non, method,
 		        interest_payment_frequency, day_count,
 		        COALESCE(default_behaviour, TRUE), COALESCE(instrument_type, ''),
-				COALESCE(market_value, 0)
+				COALESCE(market_value, 0), COALESCE(asset_liability, 1),
+				COALESCE(margin, 0), COALESCE(revolving_flag, '')
 		 FROM loan_inputs WHERE upload_id = $1 ORDER BY row_number`,
 		uploadID,
 	)
@@ -326,12 +378,13 @@ func ReprocessUpload(c *gin.Context) {
 
 		err := rows.Scan(
 			&lw.InputID,
-			&lw.Loan.ReportingDate, &lw.Loan.AccountID, &lw.Loan.CCY, &lw.Loan.Outstanding,
+			&lw.Loan.ReportingDate, &lw.Loan.AccountID, &lw.Loan.AccountNumber, &lw.Loan.CCY, &lw.Loan.Outstanding,
 			&lw.Loan.InterestRate, &lw.Loan.StartDate, &endDate, &installmentFreq,
 			&lw.Loan.ProductType, &lw.Loan.Segment, &lw.Loan.Daerah, &lw.Loan.KodePos,
 			&lw.Loan.InsuredOrUninsured, &lw.Loan.TransactionalOrNon, &lw.Loan.Method,
 			&interestPaymentFreq, &lw.Loan.DayCount,
 			&lw.Loan.DefaultBehaviour, &lw.Loan.InstrumentType, &lw.Loan.MarketValue,
+			&lw.Loan.AssetLiability, &lw.Loan.Margin, &lw.Loan.RevolvingFlag,
 		)
 		if err != nil {
 			log.Printf("Error reading loan: %v", err)
@@ -416,18 +469,18 @@ func reprocessBatch(uploadID string, loanRows []loanWithID, defaultWeights calcu
 		loan := lw.Loan
 
 		// ===== SINGLE RESULT: "Behaviour" =====
-		var irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI map[string]float64
+		var irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI, ilaapP, ilaapI map[string]float64
 		var remainingDays int
 		var baseResultType string
 
 		if loan.HasEndDate() {
 			schedule := calculator.GenerateSchedule(&loan)
-			irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI = calculator.ComputeAllBuckets(schedule, loan.ReportingDate)
+			irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI, ilaapP, ilaapI = calculator.ComputeAllBuckets(schedule, loan.ReportingDate)
 			remainingDays = loan.TenorDays()
 			baseResultType = "Contractual"
 		} else {
 			if defaultWeights != nil {
-				irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI = calculator.ComputeBehaviourBuckets(loan.Outstanding, defaultWeights)
+				irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI, ilaapP, ilaapI = calculator.ComputeBehaviourBuckets(loan.Outstanding, defaultWeights)
 			} else {
 				irrbbP = calculator.EmptyBucketMap(calculator.IRRBBLabels)
 				irrbbI = calculator.EmptyBucketMap(calculator.IRRBBLabels)
@@ -435,29 +488,54 @@ func reprocessBatch(uploadID string, loanRows []loanWithID, defaultWeights calcu
 				lcrI = calculator.EmptyBucketMap(calculator.LCRLabels)
 				nsfrP = calculator.EmptyBucketMap(calculator.NSFRLabels)
 				nsfrI = calculator.EmptyBucketMap(calculator.NSFRLabels)
+				ilaapP = calculator.EmptyBucketMap(calculator.ILAAPLabels)
+				ilaapI = calculator.EmptyBucketMap(calculator.ILAAPLabels)
 			}
 			remainingDays = 0
 			baseResultType = "Default Behaviour"
 		}
 
+		// Apply asset/liability sign flipping
+		if loan.AssetLiability == 2 {
+			irrbbP = negateBucketMap(irrbbP)
+			irrbbI = negateBucketMap(irrbbI)
+			lcrP = negateBucketMap(lcrP)
+			lcrI = negateBucketMap(lcrI)
+			nsfrP = negateBucketMap(nsfrP)
+			nsfrI = negateBucketMap(nsfrI)
+			ilaapP = negateBucketMap(ilaapP)
+			ilaapI = negateBucketMap(ilaapI)
+		}
+
 		if err := insertResult(tx, uploadID, loanInputID, remainingDays,
-			irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI, baseResultType, nil); err != nil {
+			irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI, ilaapP, ilaapI, baseResultType, nil); err != nil {
 			return fmt.Errorf("failed to insert base result: %w", err)
 		}
 
 		// ===== SCENARIO RESULTS =====
 		for _, sc := range scenarios {
-			scIrrbbP, scIrrbbI, scLcrP, scLcrI, scNsfrP, scNsfrI := calculator.ComputeAllScenarioBuckets(
+			scIrrbbP, scIrrbbI, scLcrP, scLcrI, scNsfrP, scNsfrI, scIlaapP, scIlaapI := calculator.ComputeAllScenarioBuckets(
 				sc.Data,
 				loan.Outstanding,
 				loan.MarketValue,
 				loan.ProductType, loan.CCY, loan.Segment, loan.TransactionalOrNon,
-				irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI,
+				irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI, ilaapP, ilaapI,
 			)
+
+			if loan.AssetLiability == 2 {
+				scIrrbbP = negateBucketMap(scIrrbbP)
+				scIrrbbI = negateBucketMap(scIrrbbI)
+				scLcrP = negateBucketMap(scLcrP)
+				scLcrI = negateBucketMap(scLcrI)
+				scNsfrP = negateBucketMap(scNsfrP)
+				scNsfrI = negateBucketMap(scNsfrI)
+				scIlaapP = negateBucketMap(scIlaapP)
+				scIlaapI = negateBucketMap(scIlaapI)
+			}
 
 			bid := sc.BehaviourID
 			if err := insertResult(tx, uploadID, loanInputID, remainingDays,
-				scIrrbbP, scIrrbbI, scLcrP, scLcrI, scNsfrP, scNsfrI, sc.BehaviourName, &bid); err != nil {
+				scIrrbbP, scIrrbbI, scLcrP, scLcrI, scNsfrP, scNsfrI, scIlaapP, scIlaapI, sc.BehaviourName, &bid); err != nil {
 				return fmt.Errorf("failed to insert scenario '%s' result: %w", sc.BehaviourName, err)
 			}
 		}
@@ -652,15 +730,19 @@ func GetResults(c *gin.Context) {
 
 	// Get paginated results
 	query := fmt.Sprintf(
-		`SELECT li.row_number, li.reporting_date, li.account_id, li.ccy, li.outstanding,
+		`SELECT li.row_number, li.reporting_date, li.account_id, COALESCE(li.account_number, ''),
+		        li.ccy, li.outstanding,
 		        li.interest_rate, li.start_date, li.end_date, li.installment_frequency,
 		        li.product_type, li.segment, li.daerah, li.kode_pos,
 		        li.insured_or_uninsured, li.transactional_or_non, li.method,
 		        li.interest_payment_frequency, li.day_count,
+		        COALESCE(li.instrument_type, ''), COALESCE(li.market_value, 0),
+		        COALESCE(li.asset_liability, 1), COALESCE(li.margin, 0), COALESCE(li.revolving_flag, ''),
 		        cr.remaining_days,
 		        cr.irrbb_principal, cr.irrbb_interest,
 		        cr.lcr_principal, cr.lcr_interest,
 		        cr.nsfr_principal, cr.nsfr_interest,
+		        COALESCE(cr.ilaap_principal, '{}'), COALESCE(cr.ilaap_interest, '{}'),
 		        cr.result_type
 		 FROM loan_inputs li
 		 JOIN cashflow_results cr ON cr.loan_input_id = li.id
@@ -686,15 +768,20 @@ func GetResults(c *gin.Context) {
 		var endDate sql.NullTime
 		var installmentFreq, interestPaymentFreq sql.NullInt64
 		var irrbbPJSON, irrbbIJSON, lcrPJSON, lcrIJSON, nsfrPJSON, nsfrIJSON []byte
+		var ilaapPJSON, ilaapIJSON []byte
 
 		err := rows.Scan(
-			&r.RowNumber, &reportingDate, &r.AccountID, &r.CCY, &r.Outstanding,
+			&r.RowNumber, &reportingDate, &r.AccountID, &r.AccountNumber,
+			&r.CCY, &r.Outstanding,
 			&r.InterestRate, &startDate, &endDate, &installmentFreq,
 			&r.ProductType, &r.Segment, &r.Daerah, &r.KodePos,
 			&r.InsuredOrUninsured, &r.TransactionalOrNon, &r.Method,
 			&interestPaymentFreq, &r.DayCount,
+			&r.InstrumentType, &r.MarketValue,
+			&r.AssetLiability, &r.Margin, &r.RevolvingFlag,
 			&r.RemainingDays,
 			&irrbbPJSON, &irrbbIJSON, &lcrPJSON, &lcrIJSON, &nsfrPJSON, &nsfrIJSON,
+			&ilaapPJSON, &ilaapIJSON,
 			&r.ResultType,
 		)
 		if err != nil {
@@ -725,6 +812,8 @@ func GetResults(c *gin.Context) {
 		json.Unmarshal(lcrIJSON, &r.LCRInterest)
 		json.Unmarshal(nsfrPJSON, &r.NSFRPrincipal)
 		json.Unmarshal(nsfrIJSON, &r.NSFRInterest)
+		json.Unmarshal(ilaapPJSON, &r.ILAAPPrincipal)
+		json.Unmarshal(ilaapIJSON, &r.ILAAPInterest)
 
 		// Apply filter_type transformation
 		applyFilterType(&r, filterType)
@@ -751,19 +840,23 @@ func applyFilterType(r *models.ResultRow, filterType string) {
 		r.IRRBBInterest = nil
 		r.LCRInterest = nil
 		r.NSFRInterest = nil
+		r.ILAAPInterest = nil
 	case "interest":
 		// Only interest - zero out principal
 		r.IRRBBPrincipal = nil
 		r.LCRPrincipal = nil
 		r.NSFRPrincipal = nil
+		r.ILAAPPrincipal = nil
 	case "both":
 		// Sum principal + interest into principal fields, nil out interest
 		r.IRRBBPrincipal = mergeMaps(r.IRRBBPrincipal, r.IRRBBInterest)
 		r.LCRPrincipal = mergeMaps(r.LCRPrincipal, r.LCRInterest)
 		r.NSFRPrincipal = mergeMaps(r.NSFRPrincipal, r.NSFRInterest)
+		r.ILAAPPrincipal = mergeMaps(r.ILAAPPrincipal, r.ILAAPInterest)
 		r.IRRBBInterest = nil
 		r.LCRInterest = nil
 		r.NSFRInterest = nil
+		r.ILAAPInterest = nil
 	}
 }
 

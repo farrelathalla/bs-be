@@ -58,7 +58,8 @@ func ExportExcel(c *gin.Context) {
 	}
 
 	query := fmt.Sprintf(
-		`SELECT li.row_number, li.reporting_date, li.account_id, li.ccy, li.outstanding,
+		`SELECT li.row_number, li.reporting_date, li.account_id, COALESCE(li.account_number, ''),
+		        li.ccy, li.outstanding,
 		        li.interest_rate, li.start_date, li.end_date, li.installment_frequency,
 		        li.product_type, li.segment, li.daerah, li.kode_pos,
 		        li.insured_or_uninsured, li.transactional_or_non, li.method,
@@ -66,7 +67,8 @@ func ExportExcel(c *gin.Context) {
 		        cr.remaining_days,
 		        cr.irrbb_principal, cr.irrbb_interest,
 		        cr.lcr_principal, cr.lcr_interest,
-		        cr.nsfr_principal, cr.nsfr_interest
+		        cr.nsfr_principal, cr.nsfr_interest,
+		        COALESCE(cr.ilaap_principal, '{}'), COALESCE(cr.ilaap_interest, '{}')
 		 FROM loan_inputs li
 		 JOIN cashflow_results cr ON cr.loan_input_id = li.id
 		 WHERE %s
@@ -104,6 +106,9 @@ func ExportExcel(c *gin.Context) {
 	for _, l := range calculator.IRRBBLabels {
 		headers = append(headers, "IRRBB "+l)
 	}
+	for _, l := range calculator.ILAAPLabels {
+		headers = append(headers, "ILAAP "+l)
+	}
 
 	// Write headers
 	for i, h := range headers {
@@ -124,20 +129,22 @@ func ExportExcel(c *gin.Context) {
 	for rows.Next() {
 		var rowNum, remainingDays int
 		var reportingDate, startDate, endDate time.Time
-		var accountID, ccy, productType, segment, daerah, kodePos string
+		var accountID, accountNumber, ccy, productType, segment, daerah, kodePos string
 		var insured, transactional, method, dayCount string
 		var outstanding, interestRate float64
 		var installmentFreq, interestPaymentFreq sql.NullInt64
 		var irrbbPJSON, irrbbIJSON, lcrPJSON, lcrIJSON, nsfrPJSON, nsfrIJSON []byte
+		var ilaapPJSON, ilaapIJSON []byte
 
 		err := rows.Scan(
-			&rowNum, &reportingDate, &accountID, &ccy, &outstanding,
+			&rowNum, &reportingDate, &accountID, &accountNumber, &ccy, &outstanding,
 			&interestRate, &startDate, &endDate, &installmentFreq,
 			&productType, &segment, &daerah, &kodePos,
 			&insured, &transactional, &method,
 			&interestPaymentFreq, &dayCount,
 			&remainingDays,
 			&irrbbPJSON, &irrbbIJSON, &lcrPJSON, &lcrIJSON, &nsfrPJSON, &nsfrIJSON,
+			&ilaapPJSON, &ilaapIJSON,
 		)
 		if err != nil {
 			log.Printf("Export scan error: %v", err)
@@ -146,24 +153,28 @@ func ExportExcel(c *gin.Context) {
 
 		// Parse bucket maps
 		var irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI map[string]float64
+		var ilaapP, ilaapI map[string]float64
 		json.Unmarshal(irrbbPJSON, &irrbbP)
 		json.Unmarshal(irrbbIJSON, &irrbbI)
 		json.Unmarshal(lcrPJSON, &lcrP)
 		json.Unmarshal(lcrIJSON, &lcrI)
 		json.Unmarshal(nsfrPJSON, &nsfrP)
 		json.Unmarshal(nsfrIJSON, &nsfrI)
+		json.Unmarshal(ilaapPJSON, &ilaapP)
+		json.Unmarshal(ilaapIJSON, &ilaapI)
 
 		// Apply filter type
-		var lcrVals, nsfrVals, irrbbVals map[string]float64
+		var lcrVals, nsfrVals, irrbbVals, ilaapVals map[string]float64
 		switch filterType {
 		case "bbi":
-			lcrVals, nsfrVals, irrbbVals = lcrP, nsfrP, irrbbP
+			lcrVals, nsfrVals, irrbbVals, ilaapVals = lcrP, nsfrP, irrbbP, ilaapP
 		case "interest":
-			lcrVals, nsfrVals, irrbbVals = lcrI, nsfrI, irrbbI
+			lcrVals, nsfrVals, irrbbVals, ilaapVals = lcrI, nsfrI, irrbbI, ilaapI
 		default:
 			lcrVals = mergeMaps(lcrP, lcrI)
 			nsfrVals = mergeMaps(nsfrP, nsfrI)
 			irrbbVals = mergeMaps(irrbbP, irrbbI)
+			ilaapVals = mergeMaps(ilaapP, ilaapI)
 		}
 
 		col := 1
@@ -209,6 +220,9 @@ func ExportExcel(c *gin.Context) {
 		}
 		for _, l := range calculator.IRRBBLabels {
 			setCell(irrbbVals[l])
+		}
+		for _, l := range calculator.ILAAPLabels {
+			setCell(ilaapVals[l])
 		}
 
 		rowIdx++

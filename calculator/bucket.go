@@ -1,6 +1,7 @@
 package calculator
 
 import (
+	"fmt"
 	"math"
 	"time"
 )
@@ -37,6 +38,25 @@ var IRRBBMonthEdges = []float64{
 var LCRLabels = []string{"CF <= 30D", "CF > 30D"}
 var NSFRLabels = []string{"CF < 6M", "CF 6M to 12M", "CF > 12M"}
 
+// ILAAP: 41 granular buckets — mirrors Python bucket.py BucketILAAP.LABELS
+var ILAAPLabels = []string{
+	"No Maturity",
+	"D-1", "D-2", "D-3", "D-4", "D-5", "D-6", "D-7", "D-8", "D-9", "D-10",
+	"D-11", "D-12", "D-13", "D-14", "D-15", "D-16", "D-17", "D-18", "D-19", "D-20",
+	"D-21", "D-22", "D-23", "D-24", "D-25", "D-26", "D-27", "D-28", "D-29", "D-30",
+	"W4 <= W5",
+	"W5 <= 2M",
+	"2M <= 3M",
+	"3M <= 4M",
+	"4M <= 5M",
+	"5M <= 6M",
+	"6M <= 9M",
+	"9M <= 12M",
+	"12M <= 2Y",
+	"2Y <= 5Y",
+	">5Y",
+}
+
 // EmptyBucketMap creates a map with all bucket labels set to 0
 func EmptyBucketMap(labels []string) map[string]float64 {
 	m := make(map[string]float64)
@@ -52,6 +72,82 @@ func daysBetween(a, b time.Time) int {
 
 func monthsBetween(a, b time.Time) int {
 	return (b.Year()-a.Year())*12 + int(b.Month()-a.Month())
+}
+
+// ilaapMonthsBetween calculates months between two dates using relativedelta semantics.
+// If there are residual days beyond the month boundary, months is incremented by 1.
+// This matches Python's BucketILAAP.months property.
+func ilaapMonthsBetween(a, b time.Time) int {
+	months := (b.Year()-a.Year())*12 + int(b.Month()-a.Month())
+
+	// Check for residual days: if b's day-of-month > a's day-of-month,
+	// there are extra days beyond the month boundary → push forward
+	// This mirrors: r = relativedelta(b, a); months = r.years*12 + r.months; if r.days > 0: months += 1
+	dayA := a.Day()
+	dayB := b.Day()
+	if dayB > dayA {
+		// residual days > 0
+		months++
+	} else if dayB < dayA {
+		// b hasn't reached the anchor day yet — relativedelta would give one fewer month
+		// but since we computed with month arithmetic, we need to NOT add
+		// Actually relativedelta handles this: months is correct, days would be negative
+		// meaning no residual days > 0, so no increment needed
+	}
+	// if dayB == dayA: exactly on boundary, no residual days
+	return months
+}
+
+// getILAAPBucket classifies a payment into ILAAP time buckets.
+// Mirrors Python bucket.py BucketILAAP.get_bucket()
+func getILAAPBucket(reportingDate, paymentDate time.Time) string {
+	days := daysBetween(reportingDate, paymentDate)
+	months := ilaapMonthsBetween(reportingDate, paymentDate)
+
+	// Daily buckets
+	if days <= 30 {
+		d := days
+		if d < 1 {
+			d = 1
+		}
+		return fmt.Sprintf("D-%d", d)
+	}
+
+	// Weekly
+	if days >= 31 && days <= 35 {
+		return "W4 <= W5"
+	}
+
+	if days >= 36 && months <= 2 {
+		return "W5 <= 2M"
+	}
+
+	// Monthly/yearly
+	if months <= 3 {
+		return "2M <= 3M"
+	}
+	if months <= 4 {
+		return "3M <= 4M"
+	}
+	if months <= 5 {
+		return "4M <= 5M"
+	}
+	if months <= 6 {
+		return "5M <= 6M"
+	}
+	if months <= 9 {
+		return "6M <= 9M"
+	}
+	if months <= 12 {
+		return "9M <= 12M"
+	}
+	if months <= 24 {
+		return "12M <= 2Y"
+	}
+	if months <= 60 {
+		return "2Y <= 5Y"
+	}
+	return ">5Y"
 }
 
 func getIRRBBBucket(days, months int) string {
@@ -73,15 +169,17 @@ func getIRRBBBucket(days, months int) string {
 	return IRRBBLabels[len(IRRBBLabels)-1]
 }
 
-// ComputeAllBuckets computes all 6 bucket maps from a schedule.
+// ComputeAllBuckets computes all 8 bucket maps from a schedule.
 // Exact port of calculator.py get_bucket_all.
 // Special rules:
 //   - LCR interest: only counted for <=30D bucket
 //   - NSFR interest: always 0
+//   - ILAAP interest: always 0
 func ComputeAllBuckets(schedule []ScheduleRow, reportingDate time.Time) (
 	irrbbPrincipal, irrbbInterest,
 	lcrPrincipal, lcrInterest,
-	nsfrPrincipal, nsfrInterest map[string]float64,
+	nsfrPrincipal, nsfrInterest,
+	ilaapPrincipal, ilaapInterest map[string]float64,
 ) {
 	irrbbPrincipal = EmptyBucketMap(IRRBBLabels)
 	irrbbInterest = EmptyBucketMap(IRRBBLabels)
@@ -89,6 +187,8 @@ func ComputeAllBuckets(schedule []ScheduleRow, reportingDate time.Time) (
 	lcrInterest = EmptyBucketMap(LCRLabels)
 	nsfrPrincipal = EmptyBucketMap(NSFRLabels)
 	nsfrInterest = EmptyBucketMap(NSFRLabels)
+	ilaapPrincipal = EmptyBucketMap(ILAAPLabels)
+	ilaapInterest = EmptyBucketMap(ILAAPLabels)
 
 	if len(schedule) == 0 {
 		return
@@ -119,6 +219,10 @@ func ComputeAllBuckets(schedule []ScheduleRow, reportingDate time.Time) (
 		} else {
 			nsfrPrincipal["CF > 12M"] += row.Principal
 		}
+
+		// ILAAP (interest always 0)
+		ilaapBucket := getILAAPBucket(reportingDate, row.PaymentDate)
+		ilaapPrincipal[ilaapBucket] += row.Principal
 	}
 
 	roundMap(irrbbPrincipal)
@@ -127,6 +231,8 @@ func ComputeAllBuckets(schedule []ScheduleRow, reportingDate time.Time) (
 	roundMap(lcrInterest)
 	roundMap(nsfrPrincipal)
 	roundMap(nsfrInterest)
+	roundMap(ilaapPrincipal)
+	roundMap(ilaapInterest)
 
 	return
 }

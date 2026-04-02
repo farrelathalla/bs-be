@@ -23,6 +23,7 @@ func runMigrations(db *sql.DB) {
 		"migrations/006_revision.sql",
 		"migrations/007_additional_refs.sql",
 		"migrations/008_presets.sql",
+		"migrations/009_ilaap_and_fields.sql",
 	}
 
 	for _, f := range migrationFiles {

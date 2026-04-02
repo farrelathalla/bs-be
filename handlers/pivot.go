@@ -220,7 +220,8 @@ func GetPivot(c *gin.Context) {
 		bucketQuery := fmt.Sprintf(
 			`SELECT cr.irrbb_principal, cr.irrbb_interest,
 			        cr.lcr_principal, cr.lcr_interest,
-			        cr.nsfr_principal, cr.nsfr_interest
+			        cr.nsfr_principal, cr.nsfr_interest,
+			        COALESCE(cr.ilaap_principal, '{}'), COALESCE(cr.ilaap_interest, '{}')
 			 FROM loan_inputs li
 			 JOIN cashflow_results cr ON cr.loan_input_id = li.id
 			 WHERE %s`, groupWhere,
@@ -238,10 +239,12 @@ func GetPivot(c *gin.Context) {
 		aggLcrI := calculator.EmptyBucketMap(calculator.LCRLabels)
 		aggNsfrP := calculator.EmptyBucketMap(calculator.NSFRLabels)
 		aggNsfrI := calculator.EmptyBucketMap(calculator.NSFRLabels)
+		aggIlaapP := calculator.EmptyBucketMap(calculator.ILAAPLabels)
+		aggIlaapI := calculator.EmptyBucketMap(calculator.ILAAPLabels)
 
 		for bucketRows.Next() {
-			var ipJ, iiJ, lpJ, liJ, npJ, niJ []byte
-			if err := bucketRows.Scan(&ipJ, &iiJ, &lpJ, &liJ, &npJ, &niJ); err != nil {
+			var ipJ, iiJ, lpJ, liJ, npJ, niJ, ilapJ, ilaiJ []byte
+			if err := bucketRows.Scan(&ipJ, &iiJ, &lpJ, &liJ, &npJ, &niJ, &ilapJ, &ilaiJ); err != nil {
 				continue
 			}
 
@@ -251,11 +254,13 @@ func GetPivot(c *gin.Context) {
 			addJSONToMap(aggLcrI, liJ)
 			addJSONToMap(aggNsfrP, npJ)
 			addJSONToMap(aggNsfrI, niJ)
+			addJSONToMap(aggIlaapP, ilapJ)
+			addJSONToMap(aggIlaapI, ilaiJ)
 		}
 		bucketRows.Close()
 
 		// Apply filter type
-		aggregates := buildAggregates(aggIrrbbP, aggIrrbbI, aggLcrP, aggLcrI, aggNsfrP, aggNsfrI, filterType)
+		aggregates := buildAggregates(aggIrrbbP, aggIrrbbI, aggLcrP, aggLcrI, aggNsfrP, aggNsfrI, aggIlaapP, aggIlaapI, filterType)
 		aggregates["outstanding"] = calculator.Round2(g.TotalOutstanding)
 		aggregates["remaining_days"] = float64(g.TotalRemDays)
 
@@ -283,7 +288,7 @@ func addJSONToMap(target map[string]float64, jsonData []byte) {
 	}
 }
 
-func buildAggregates(irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI map[string]float64, filterType string) map[string]float64 {
+func buildAggregates(irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI, ilaapP, ilaapI map[string]float64, filterType string) map[string]float64 {
 	result := make(map[string]float64)
 
 	switch filterType {
@@ -297,6 +302,9 @@ func buildAggregates(irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI map[string]float64
 		for k, v := range nsfrP {
 			result["nsfr__"+k] = calculator.Round2(v)
 		}
+		for k, v := range ilaapP {
+			result["ilaap__"+k] = calculator.Round2(v)
+		}
 	case "interest":
 		for k, v := range irrbbI {
 			result["irrbb__"+k] = calculator.Round2(v)
@@ -307,6 +315,9 @@ func buildAggregates(irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI map[string]float64
 		for k, v := range nsfrI {
 			result["nsfr__"+k] = calculator.Round2(v)
 		}
+		for k, v := range ilaapI {
+			result["ilaap__"+k] = calculator.Round2(v)
+		}
 	default: // both
 		for k, v := range irrbbP {
 			result["irrbb__"+k] = calculator.Round2(v + irrbbI[k])
@@ -316,6 +327,9 @@ func buildAggregates(irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI map[string]float64
 		}
 		for k, v := range nsfrP {
 			result["nsfr__"+k] = calculator.Round2(v + nsfrI[k])
+		}
+		for k, v := range ilaapP {
+			result["ilaap__"+k] = calculator.Round2(v + ilaapI[k])
 		}
 	}
 
@@ -474,7 +488,8 @@ func GetSummary(c *gin.Context) {
 	bucketQuery := fmt.Sprintf(
 		`SELECT cr.irrbb_principal, cr.irrbb_interest,
 		        cr.lcr_principal, cr.lcr_interest,
-		        cr.nsfr_principal, cr.nsfr_interest
+		        cr.nsfr_principal, cr.nsfr_interest,
+		        COALESCE(cr.ilaap_principal, '{}'), COALESCE(cr.ilaap_interest, '{}')
 		 FROM loan_inputs li
 		 JOIN cashflow_results cr ON cr.loan_input_id = li.id
 		 WHERE %s`, whereClause,
@@ -487,23 +502,27 @@ func GetSummary(c *gin.Context) {
 	aggLcrI := calculator.EmptyBucketMap(calculator.LCRLabels)
 	aggNsfrP := calculator.EmptyBucketMap(calculator.NSFRLabels)
 	aggNsfrI := calculator.EmptyBucketMap(calculator.NSFRLabels)
+	aggIlaapP := calculator.EmptyBucketMap(calculator.ILAAPLabels)
+	aggIlaapI := calculator.EmptyBucketMap(calculator.ILAAPLabels)
 
 	if bucketRows != nil {
 		defer bucketRows.Close()
 		for bucketRows.Next() {
-			var ipJ, iiJ, lpJ, liJ, npJ, niJ []byte
-			if bucketRows.Scan(&ipJ, &iiJ, &lpJ, &liJ, &npJ, &niJ) == nil {
+			var ipJ, iiJ, lpJ, liJ, npJ, niJ, ilapJ, ilaiJ []byte
+			if bucketRows.Scan(&ipJ, &iiJ, &lpJ, &liJ, &npJ, &niJ, &ilapJ, &ilaiJ) == nil {
 				addJSONToMap(aggIrrbbP, ipJ)
 				addJSONToMap(aggIrrbbI, iiJ)
 				addJSONToMap(aggLcrP, lpJ)
 				addJSONToMap(aggLcrI, liJ)
 				addJSONToMap(aggNsfrP, npJ)
 				addJSONToMap(aggNsfrI, niJ)
+				addJSONToMap(aggIlaapP, ilapJ)
+				addJSONToMap(aggIlaapI, ilaiJ)
 			}
 		}
 	}
 
-	bucketTotals := buildAggregates(aggIrrbbP, aggIrrbbI, aggLcrP, aggLcrI, aggNsfrP, aggNsfrI, filterType)
+	bucketTotals := buildAggregates(aggIrrbbP, aggIrrbbI, aggLcrP, aggLcrI, aggNsfrP, aggNsfrI, aggIlaapP, aggIlaapI, filterType)
 
 	// Build column_sums: include outstanding and all bucket totals
 	columnSums := make(map[string]float64)

@@ -2,10 +2,11 @@ package models
 
 import "time"
 
-// Loan represents a single loan record from CSV input
+// Loan represents a single loan record from CSV/XLSX input
 type Loan struct {
 	ReportingDate            time.Time
 	AccountID                string
+	AccountNumber            string
 	CCY                      string
 	Outstanding              float64
 	InterestRate             float64  // decimal e.g. 0.09 for 9%
@@ -24,6 +25,9 @@ type Loan struct {
 	DefaultBehaviour         bool   // always apply default behaviour
 	InstrumentType           string
 	MarketValue              float64
+	AssetLiability           int    // 1 = asset (positive), 2 = liability (negate results)
+	Margin                   float64
+	RevolvingFlag            string
 }
 
 // TenorDays returns remaining days from reporting date to end date
