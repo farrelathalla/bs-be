@@ -277,6 +277,15 @@ func processBatch(uploadID string, loans []models.Loan, startIdx int, defaultWei
 			baseResultType = "Default Behaviour"
 		}
 
+		// Keep the unsigned base result. A scenario falls back to these values
+		// for any bucket type it has no rule for, and the scenario result is
+		// negated as a whole below — so feeding it already-negated values would
+		// flip those buckets twice and report a liability as an asset.
+		fbIrrbbP, fbIrrbbI := irrbbP, irrbbI
+		fbLcrP, fbLcrI := lcrP, lcrI
+		fbNsfrP, fbNsfrI := nsfrP, nsfrI
+		fbIlaapP, fbIlaapI := ilaapP, ilaapI
+
 		// Apply asset/liability sign flipping: liability (2) negates all values
 		if loan.AssetLiability == 2 {
 			irrbbP = negateBucketMap(irrbbP)
@@ -301,10 +310,10 @@ func processBatch(uploadID string, loans []models.Loan, startIdx int, defaultWei
 				loan.Outstanding,
 				loan.MarketValue,
 				loan.ProductType, loan.CCY, loan.Segment, loan.TransactionalOrNon,
-				irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI, ilaapP, ilaapI, // fallback to base result
+				fbIrrbbP, fbIrrbbI, fbLcrP, fbLcrI, fbNsfrP, fbNsfrI, fbIlaapP, fbIlaapI, // unsigned base result
 			)
 
-			// Sign flipping already applied to fallback values; apply to scenario-computed values too
+			// Negate the whole scenario result, computed and fallback alike
 			if loan.AssetLiability == 2 {
 				scIrrbbP = negateBucketMap(scIrrbbP)
 				scIrrbbI = negateBucketMap(scIrrbbI)
@@ -495,6 +504,13 @@ func reprocessBatch(uploadID string, loanRows []loanWithID, defaultWeights calcu
 			baseResultType = "Default Behaviour"
 		}
 
+		// Unsigned base result, kept as the scenario fallback — see the matching
+		// comment in processBatch.
+		fbIrrbbP, fbIrrbbI := irrbbP, irrbbI
+		fbLcrP, fbLcrI := lcrP, lcrI
+		fbNsfrP, fbNsfrI := nsfrP, nsfrI
+		fbIlaapP, fbIlaapI := ilaapP, ilaapI
+
 		// Apply asset/liability sign flipping
 		if loan.AssetLiability == 2 {
 			irrbbP = negateBucketMap(irrbbP)
@@ -519,7 +535,7 @@ func reprocessBatch(uploadID string, loanRows []loanWithID, defaultWeights calcu
 				loan.Outstanding,
 				loan.MarketValue,
 				loan.ProductType, loan.CCY, loan.Segment, loan.TransactionalOrNon,
-				irrbbP, irrbbI, lcrP, lcrI, nsfrP, nsfrI, ilaapP, ilaapI,
+				fbIrrbbP, fbIrrbbI, fbLcrP, fbLcrI, fbNsfrP, fbNsfrI, fbIlaapP, fbIlaapI,
 			)
 
 			if loan.AssetLiability == 2 {

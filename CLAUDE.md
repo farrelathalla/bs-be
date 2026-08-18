@@ -260,7 +260,7 @@ user_presets (id BIGSERIAL, user_id FK, name, config JSONB, created_at, updated_
 - **IRRBB:** 18 time buckets from ≤1M to >20Y (day-based first bucket, month-based rest)
 - **LCR:** 2 buckets (CF ≤30D, CF >30D) — interest only counted in ≤30D bucket
 - **NSFR:** 3 buckets (CF <6M, CF 6M-12M, CF >12M) — interest always 0
-- **ILAAP:** 41 granular buckets (No Maturity, D-1..D-30, W4<=W5, W5<=2M, monthly, yearly up to >5Y) — interest always 0
+- **ILAAP:** 41 granular buckets (No Maturity, D-1..D-30, W4<=W5, W5<=2M, monthly, yearly up to >5Y) — interest accrues per bucket, the same way IRRBB does (it used to be forced to 0, which diverged from `calculator.py`)
   - Uses `ilaapMonthsBetween()` with relativedelta semantics: if residual days exist beyond month boundary, month count increments by 1
   - Uses `getILAAPBucket()` for day-level classification (D-1 through D-30, then week/month/year buckets)
 
@@ -377,7 +377,9 @@ Loan,IDR,Retail,Transactional,LCR,90%
 - Percentage values > 1.0 are automatically divided by 100
 - Parsed by `parseScenarioXLSX()` in `handlers/behaviour.go`
 
-**Validation:** Overlap detection across both sections — if two rules match the same loan criteria for the same bucket type, it's rejected. `"All"` acts as wildcard (empty string does NOT). Additionally, exact duplicate rows (same BucketType, BucketName, ProductType, CCY, Segment, Transactional) are rejected.
+**Validation:** Overlap detection runs **within** each section, never across them. Rows are first deduplicated on their distinct key — Bucket on (BucketType, ProductType, CCY, Segment, Transactional, ValueType), Cashflow Assumption on the five criteria — and only then compared pairwise. Deduplication is essential: a sheet carries one row per Bucket Name, so a single rule legitimately spans 18 rows for IRRBB and 42 for ILAAP. `"All"` acts as wildcard (empty string does NOT). Exact duplicate rows (same BucketType, BucketName, ProductType, CCY, Segment, Transactional) are also rejected.
+
+There is deliberately **no cross-section check**. A scenario value is `base × bucketPercentage × cashflowAssumption` and the two factors are looked up independently, so a Bucket rule and a Cashflow Assumption rule covering the same criteria are the intended configuration — rejecting them made every functional scenario file unuploadable.
 
 ---
 
@@ -407,7 +409,9 @@ Production URL: `https://103.103.22.207:8002`
 - **Migration files run on every startup** — uses `CREATE TABLE IF NOT EXISTS` and `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` for idempotency
 - **method / day_count mapping** — validator accepts both string names and numeric IDs (1=Annuity/30/360, 2=Flat/ACT/360, 3=ACT/365)
 - **Indonesian number format** — validator handles `1.000.000,50` → `1000000.50`
-- **Scenario overlap validator** — mirrors `installment_software/validator.py`, checks within Bucket section, within Cashflow section, and cross-section. Also detects exact duplicate rows (Step 0). Only `"All"` acts as wildcard — empty string does NOT (fixed to match Python)
+- **Scenario overlap validator** — mirrors `installment_software/validator.py`. Deduplicates on the distinct key **before** comparing pairwise, checks within the Bucket section and within the Cashflow section, and does **not** check across them. Also detects exact duplicate rows (Step 0). Only `"All"` acts as wildcard — empty string does NOT
+- **30/360 year fraction** — counts *whole* months via `fullMonthsBetween`, matching `dateutil.relativedelta`. A plain calendar-month subtraction overstates the period whenever the end day-of-month precedes the start's (2025-12-31 → 2026-06-01 is 5 months, not 6), and a naive day-of-month test breaks on end-of-month clamping (2025-01-31 → 2026-02-28 *is* a full 13 months)
+- **Scenario fallback and sign flipping** — `ComputeAllScenarioBuckets` must be fed the **unsigned** base result. The scenario result is negated as a whole afterwards, so passing already-negated fallback values double-flips them and reports a liability as an asset
 - **Asset/Liability sign flipping** — when `loan.AssetLiability == 2`, all bucket values (principal + interest) are negated via `negateBucketMap()` after calculation, before insert
 - **ILAAP bucketing** — 41 granular buckets with day-level precision. `ilaapMonthsBetween()` uses relativedelta semantics where residual days increment month count
 - **XLSX data files** — use `validator/xlsx.go` via excelize. Excel date serial numbers (e.g., `44927`) are converted to `time.Time`. Float values for Method/DayCount/InstrumentType (e.g., `"1.0"`) are truncated to integers before ID mapping

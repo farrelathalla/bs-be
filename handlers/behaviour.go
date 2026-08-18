@@ -55,10 +55,10 @@ func UploadBehaviour(c *gin.Context) {
 		return
 	}
 
-	// Validate no overlapping rules between Bucket and Cashflow Assumption
+	// Validate no overlapping rules within either section
 	overlapErrors := validateScenarioCSV(bucketConfigs, cashflowAssumptions)
 	if len(overlapErrors) > 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Overlapping rules detected", "details": overlapErrors})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Overlapping rules detected", "details": capDetails(overlapErrors)})
 		return
 	}
 
@@ -258,10 +258,10 @@ func UpdateBehaviour(c *gin.Context) {
 			return
 		}
 
-		// Validate no overlapping rules
+		// Validate no overlapping rules within either section
 		overlapErrors := validateScenarioCSV(bucketConfigs, cashflowAssumptions)
 		if len(overlapErrors) > 0 {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Overlapping rules detected", "details": overlapErrors})
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Overlapping rules detected", "details": capDetails(overlapErrors)})
 			return
 		}
 
@@ -523,8 +523,98 @@ func formatOverlapPair(keysA, keysB []string, colNames []string) string {
 	return strings.Join(parts, ", ")
 }
 
-// validateScenarioCSV checks for overlapping rules within bucket configs,
-// within cashflow assumptions, and across both sections.
+// maxReportedDetails bounds the error list sent to the client. The frontend
+// joins every entry into a single message, so an unbounded list is unreadable.
+const maxReportedDetails = 25
+
+// capDetails truncates a details list, noting how many were omitted.
+func capDetails(details []string) []string {
+	if len(details) <= maxReportedDetails {
+		return details
+	}
+	out := make([]string, 0, maxReportedDetails+1)
+	out = append(out, details[:maxReportedDetails]...)
+	return append(out, fmt.Sprintf("… and %d more", len(details)-maxReportedDetails))
+}
+
+// distinctRule is one deduplicated rule: the key column values (original
+// casing, for error messages) plus every source row that produced it.
+type distinctRule struct {
+	keys []string
+	rows []int
+}
+
+// distinctRules collapses rows that share an identical case-insensitive key.
+// A scenario sheet carries one row per Bucket Name, so a single rule such as
+// "IRRBB / Loan / IDR / Retail / Transactional" legitimately spans 18 rows.
+// Those rows are the same rule, not 18 rules overlapping each other, so they
+// must be folded together before any pairwise comparison.
+// Mirrors Validator._distinct_keyed in installment_software/validator.py.
+func distinctRules(n int, keysAt func(int) []string) []distinctRule {
+	pos := make(map[string]int, n)
+	out := make([]distinctRule, 0, n)
+	for i := 0; i < n; i++ {
+		keys := keysAt(i)
+		norm := make([]string, len(keys))
+		for j, v := range keys {
+			norm[j] = strings.ToLower(strings.TrimSpace(v))
+		}
+		id := strings.Join(norm, "\x00")
+		if p, seen := pos[id]; seen {
+			out[p].rows = append(out[p].rows, i+2)
+			continue
+		}
+		pos[id] = len(out)
+		out = append(out, distinctRule{keys: keys, rows: []int{i + 2}})
+	}
+	return out
+}
+
+// rulesOverlap reports whether two rules can both match the same loan, testing
+// only the first n key columns (trailing columns such as Value Type take part
+// in deduplication but not in the overlap test).
+func rulesOverlap(a, b distinctRule, n int) bool {
+	for k := 0; k < n; k++ {
+		if !valuesOverlap(a.keys[k], b.keys[k]) {
+			return false
+		}
+	}
+	return true
+}
+
+// formatRows renders the source rows behind a rule, e.g. "2-19" or "2, 5, 9".
+func formatRows(rows []int) string {
+	if len(rows) == 1 {
+		return fmt.Sprintf("row %d", rows[0])
+	}
+	contiguous := true
+	for i := 1; i < len(rows); i++ {
+		if rows[i] != rows[i-1]+1 {
+			contiguous = false
+			break
+		}
+	}
+	if contiguous {
+		return fmt.Sprintf("rows %d-%d", rows[0], rows[len(rows)-1])
+	}
+	parts := make([]string, len(rows))
+	for i, r := range rows {
+		parts[i] = strconv.Itoa(r)
+	}
+	return "rows " + strings.Join(parts, ", ")
+}
+
+// validateScenarioCSV checks for overlapping rules within the bucket configs
+// and within the cashflow assumptions.
+//
+// There is deliberately NO cross-section check. The two sections are
+// complementary rather than competing: a scenario value is
+// baseValue × bucketPercentage × cashflowAssumption, and the two factors are
+// looked up independently (FindMatchingConfig / FindCashflowAssumption). A
+// bucket rule and a cashflow-assumption rule that cover the same criteria are
+// therefore the intended configuration, not an ambiguity — flagging them made
+// every functional scenario file unuploadable.
+//
 // Returns a list of human-readable error strings (empty = valid).
 func validateScenarioCSV(buckets []bucketConfigInternal, cfs []cashflowAssumptionInternal) []string {
 	var errs []string
@@ -550,63 +640,50 @@ func validateScenarioCSV(buckets []bucketConfigInternal, cfs []cashflowAssumptio
 		}
 	}
 
-	// ── 1. Bucket section: overlap on (BucketType, ProductType, CCY, Segment, Transactional) ──
+	// ── 1. Bucket section ──
+	// Deduplicate on (BucketType, ProductType, CCY, Segment, Transactional,
+	// ValueType), then test overlap on the first five of those.
 	bucketKeyCols := []string{"BucketType", "ProductType", "CCY", "Segment", "Transactional"}
-	for i := 0; i < len(buckets); i++ {
-		keysI := []string{buckets[i].BucketType, buckets[i].ProductType, buckets[i].CCY, buckets[i].Segment, buckets[i].Transactional}
-		for j := i + 1; j < len(buckets); j++ {
-			keysJ := []string{buckets[j].BucketType, buckets[j].ProductType, buckets[j].CCY, buckets[j].Segment, buckets[j].Transactional}
-			overlap := true
-			for k := range keysI {
-				if !valuesOverlap(keysI[k], keysJ[k]) {
-					overlap = false
-					break
-				}
+	bucketRules := distinctRules(len(buckets), func(i int) []string {
+		return []string{
+			buckets[i].BucketType, buckets[i].ProductType, buckets[i].CCY,
+			buckets[i].Segment, buckets[i].Transactional, buckets[i].ValueType,
+		}
+	})
+	for i := 0; i < len(bucketRules); i++ {
+		for j := i + 1; j < len(bucketRules); j++ {
+			if !rulesOverlap(bucketRules[i], bucketRules[j], len(bucketKeyCols)) {
+				continue
 			}
-			if overlap {
-				desc := formatOverlapPair(keysI, keysJ, bucketKeyCols)
-				errs = append(errs, fmt.Sprintf("[Bucket] Overlapping rule at rows %d and %d: %s", i+2, j+2, desc))
-			}
+			desc := formatOverlapPair(bucketRules[i].keys, bucketRules[j].keys, bucketKeyCols)
+			errs = append(errs, fmt.Sprintf(
+				"[Bucket] Overlapping rule between %s and %s: %s — Value Type: '%s' vs '%s'",
+				formatRows(bucketRules[i].rows), formatRows(bucketRules[j].rows), desc,
+				bucketRules[i].keys[5], bucketRules[j].keys[5],
+			))
 		}
 	}
 
-	// ── 2. Cashflow Assumption section: overlap on (ProductType, CCY, Segment, Transactional, BucketType) ──
+	// ── 2. Cashflow Assumption section ──
+	// Deduplicate and test overlap on the same five criteria. This section has
+	// no Value Type column, so it plays no part here.
 	cfKeyCols := []string{"ProductType", "CCY", "Segment", "Transactional", "BucketType"}
-	for i := 0; i < len(cfs); i++ {
-		keysI := []string{cfs[i].ProductType, cfs[i].CCY, cfs[i].Segment, cfs[i].Transactional, cfs[i].BucketType}
-		for j := i + 1; j < len(cfs); j++ {
-			keysJ := []string{cfs[j].ProductType, cfs[j].CCY, cfs[j].Segment, cfs[j].Transactional, cfs[j].BucketType}
-			overlap := true
-			for k := range keysI {
-				if !valuesOverlap(keysI[k], keysJ[k]) {
-					overlap = false
-					break
-				}
-			}
-			if overlap {
-				desc := formatOverlapPair(keysI, keysJ, cfKeyCols)
-				errs = append(errs, fmt.Sprintf("[Cashflow Assumption] Overlapping rule at rows %d and %d: %s", i+2, j+2, desc))
-			}
+	cfRules := distinctRules(len(cfs), func(i int) []string {
+		return []string{
+			cfs[i].ProductType, cfs[i].CCY, cfs[i].Segment,
+			cfs[i].Transactional, cfs[i].BucketType,
 		}
-	}
-
-	// ── 3. Cross-section: Bucket × Cashflow Assumption on (BucketType, ProductType, CCY, Segment, Transactional) ──
-	crossKeyCols := []string{"BucketType", "ProductType", "CCY", "Segment", "Transactional"}
-	for i, b := range buckets {
-		keysB := []string{b.BucketType, b.ProductType, b.CCY, b.Segment, b.Transactional}
-		for j, cf := range cfs {
-			keysCF := []string{cf.BucketType, cf.ProductType, cf.CCY, cf.Segment, cf.Transactional}
-			overlap := true
-			for k := range keysB {
-				if !valuesOverlap(keysB[k], keysCF[k]) {
-					overlap = false
-					break
-				}
+	})
+	for i := 0; i < len(cfRules); i++ {
+		for j := i + 1; j < len(cfRules); j++ {
+			if !rulesOverlap(cfRules[i], cfRules[j], len(cfKeyCols)) {
+				continue
 			}
-			if overlap {
-				desc := formatOverlapPair(keysB, keysCF, crossKeyCols)
-				errs = append(errs, fmt.Sprintf("[Cross-Sheet] Bucket row %d overlaps with Cashflow Assumption row %d: %s", i+2, j+2, desc))
-			}
+			desc := formatOverlapPair(cfRules[i].keys, cfRules[j].keys, cfKeyCols)
+			errs = append(errs, fmt.Sprintf(
+				"[Cashflow Assumption] Overlapping rule between %s and %s: %s",
+				formatRows(cfRules[i].rows), formatRows(cfRules[j].rows), desc,
+			))
 		}
 	}
 

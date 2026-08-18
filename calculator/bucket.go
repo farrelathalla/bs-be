@@ -174,7 +174,7 @@ func getIRRBBBucket(days, months int) string {
 // Special rules:
 //   - LCR interest: only counted for <=30D bucket
 //   - NSFR interest: always 0
-//   - ILAAP interest: always 0
+//   - ILAAP interest: accrues per bucket, the same way IRRBB does
 func ComputeAllBuckets(schedule []ScheduleRow, reportingDate time.Time) (
 	irrbbPrincipal, irrbbInterest,
 	lcrPrincipal, lcrInterest,
@@ -220,9 +220,11 @@ func ComputeAllBuckets(schedule []ScheduleRow, reportingDate time.Time) (
 			nsfrPrincipal["CF > 12M"] += row.Principal
 		}
 
-		// ILAAP (interest always 0)
+		// ILAAP — interest accrues per bucket, matching calculator.py _flatten,
+		// which treats ILAAP the same as IRRBB
 		ilaapBucket := getILAAPBucket(reportingDate, row.PaymentDate)
 		ilaapPrincipal[ilaapBucket] += row.Principal
+		ilaapInterest[ilaapBucket] += row.Interest
 	}
 
 	roundMap(irrbbPrincipal)
