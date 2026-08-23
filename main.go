@@ -24,6 +24,7 @@ func runMigrations(db *sql.DB) {
 		"migrations/007_additional_refs.sql",
 		"migrations/008_presets.sql",
 		"migrations/009_ilaap_and_fields.sql",
+		"migrations/010_master_data.sql",
 	}
 
 	for _, f := range migrationFiles {
@@ -103,6 +104,10 @@ func main() {
 
 		// Reference maps (all users can read)
 		auth.GET("/reference-maps", handlers.GetAllReferenceMaps)
+
+		// Master data guide + Excel template (all users can read)
+		auth.GET("/master-data/schema", handlers.GetMasterDataSchema)
+		auth.GET("/master-data/template", handlers.DownloadTemplate)
 
 		// Presets
 		auth.GET("/presets", handlers.ListPresets)

@@ -51,7 +51,10 @@ bs-be/
 │   │                           GET /results/:id/filter-options — distinct column values
 │   ├── export.go               GET /export/:id — Excel (.xlsx) download
 │   ├── preset.go               CRUD /presets — user-scoped JSON config presets
-│   └── reference.go            CRUD /reference/:table — superadmin-only reference data management
+│   ├── reference.go            CRUD /reference/:table — superadmin-only master data management
+│   │                           + delete guard (a code in use by loan_inputs cannot be removed)
+│   └── masterdata.go           GET /master-data/schema — the upload contract (columns + allowed codes)
+│                               GET /master-data/template — generated .xlsx starter file
 ├── models/
 │   ├── loan.go                 Loan struct (parsed from CSV/XLSX), TenorDays/TenorMonths helpers
 │   │                           Fields: AccountNumber, AssetLiability, Margin, RevolvingFlag (added)
@@ -65,10 +68,16 @@ bs-be/
 │   │                           ComputeAllScenarioBuckets, LoadScenarioData
 │   └── yearfrac.go             YearFraction (30/360, ACT/360, ACT/365), PMT, Round2
 ├── validator/
-│   ├── csv.go                  ValidateAndParseCSV — column aliases, delimiter detection, BOM removal,
-│   │                           date/number parsing (Indonesian format), ID→name mapping for Method/DayCount
-│   └── xlsx.go                 ValidateAndParseXLSX — Excel file parsing via excelize, Excel date serial
-│                               number handling, float-to-int conversion, interest rate kept as decimal
+│   ├── schema.go               InputColumns — THE catalog of upload columns (required flag, format,
+│   │                           master data table, aliases, example). RequiredColumns / OptionalColumns /
+│   │                           columnAliases are all derived from it. SupportedMethods / SupportedDayCounts.
+│   ├── master.go               MasterTables catalog, MasterData snapshot (cached 30s + explicit
+│   │                           InvalidateMasterData), ResolveID / Name / Allowed, checkCode
+│   ├── row.go                  validateRow — the ONE per-row implementation shared by CSV and XLSX
+│   ├── csv.go                  ValidateAndParseCSV — delimiter detection, BOM removal, Indonesian
+│   │                           number format, checkRequiredHeaders
+│   └── xlsx.go                 ValidateAndParseXLSX — excelize, Excel date serial handling; delegates
+│                               every field check to validateRow
 ├── migrations/
 │   ├── 001_init.sql            users, uploads, loan_inputs, cashflow_results, sessions
 │   ├── 003_reference_tables.sql product_types, segments, methods, day_counts, currencies, etc.
@@ -77,8 +86,9 @@ bs-be/
 │   ├── 006_revision.sql        behaviour_id on cashflow_results, market_value on loan_inputs
 │   ├── 007_additional_refs.sql instrument_types, transactional_types, installment_frequencies
 │   ├── 008_presets.sql         user_presets table
-│   └── 009_ilaap_and_fields.sql ILAAP JSONB columns on cashflow_results,
-│                               account_number/asset_liability/margin/revolving_flag on loan_inputs
+│   ├── 009_ilaap_and_fields.sql ILAAP JSONB columns on cashflow_results,
+│   │                           account_number/asset_liability/margin/revolving_flag on loan_inputs
+│   └── 010_master_data.sql     insured_types, asset_liabilities, revolving_flags
 └── nginx/
     ├── nginx.conf              SSL termination → proxy_pass http://api:8002
     └── entrypoint.sh           Self-signed cert generation on startup
@@ -161,9 +171,13 @@ scenario_cashflow_assumptions (id, behaviour_id FK CASCADE, product_type, ccy, s
                                bucket_type, percentage DEFAULT 1.0)
 ```
 
-### Reference Tables (all share `id TEXT PK, name TEXT, updated_at` schema)
+### Reference / Master Data Tables (all share `id TEXT PK, name TEXT, updated_at` schema)
 
-`product_types`, `segments`, `methods`, `day_counts`, `currencies`, `instrument_types`, `transactional_types`, `installment_frequencies`
+`product_types`, `segments`, `methods`, `day_counts`, `currencies`, `instrument_types`, `transactional_types`, `installment_frequencies`, `insured_types`, `asset_liabilities`, `revolving_flags`
+
+The list lives in **one place**: `validator.MasterTables`. `handlers/reference.go` derives its
+whitelist from it, and `handlers/masterdata.go` renders the guide and the Excel template from it.
+Adding a table means adding a migration, a seed entry, and one line in `MasterTables`.
 
 ### User Presets
 
@@ -206,9 +220,20 @@ user_presets (id BIGSERIAL, user_id FK, name, config JSONB, created_at, updated_
   - Handles Excel date serial numbers and date string formats
   - Converts float strings (e.g., `"1.0"`) to integers for Method/DayCount/InstrumentType
   - Interest Rate is NOT divided by 100 (Excel stores as decimal already)
-- **Common to both:**
-  - Method accepts ID (`1`=annuity, `2`=flat) or string
-  - DayCount accepts ID (`1`=30/360, `2`=ACT/360, `3`=ACT/365) or string
+- **Common to both:** every field check runs in `validator.validateRow`, so the two formats accept
+  exactly the same values. It collects **all** problems in a row rather than stopping at the first.
+  - Every coded column is checked against its master data table (`validator.InputColumns` declares
+    which). An unknown code is rejected with a message naming every accepted code — e.g.
+    `'5' is not in the Product Type master data. Allowed values: 1 = Loan, 2 = Deposit, …`
+  - Coded cells accept the ID (`1`) or the master data name (`Annuity`, case-insensitive). Excel's
+    float rendering (`1.0`) is normalised to `1`.
+  - Method and Day Count must additionally resolve to something the calculator implements
+    (`SupportedMethods` / `SupportedDayCounts`) — a superadmin adding "Bullet" to `methods` does not
+    silently produce wrong numbers.
+  - Blank / `NULL` / `NA` / `N/A` / `NONE` / `-` all count as "not supplied".
+  - Outstanding must be ≥ 0 (report a liability with `Asset_Liability = 2`, not a negative number).
+  - Interest Rate is capped at 100% after conversion; the error names the unit the format expects.
+  - End Date, when present with a Start Date, must not precede it.
   - EndDate can be empty/NULL/NA → `nil` (no maturity loan)
 - Saves file to disk, creates `uploads` record with status `processing`
 - Spawns goroutine: `processLoans(uploadID, loans)`
@@ -323,6 +348,8 @@ user_presets (id BIGSERIAL, user_id FK, name, config JSONB, created_at, updated_
 | PUT    | `/api/presets/:id`                 | Update preset                                                        |
 | DELETE | `/api/presets/:id`                 | Delete preset                                                        |
 | GET    | `/api/reference-maps`              | Get all reference tables (all authenticated users)                   |
+| GET    | `/api/master-data/schema`          | Upload contract: every column + the codes it accepts                 |
+| GET    | `/api/master-data/template`        | Generated .xlsx starter (headers, hints, dropdowns, code sheet)      |
 
 ### SuperAdmin Only
 
@@ -407,7 +434,12 @@ Production URL: `https://103.103.22.207:8002`
 - **Default behaviour cannot be modified or deleted** — protected in `UpdateBehaviour` and `DeleteBehaviour` handlers
 - **Pivot aggregation** — bucket sums are computed in Go, not SQL. For each group, a second query fetches all JSONB rows and sums them in-memory.
 - **Migration files run on every startup** — uses `CREATE TABLE IF NOT EXISTS` and `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` for idempotency
-- **method / day_count mapping** — validator accepts both string names and numeric IDs (1=Annuity/30/360, 2=Flat/ACT/360, 3=ACT/365)
+- **method / day_count mapping** — resolved through the `methods` / `day_counts` master data, then checked against `SupportedMethods` / `SupportedDayCounts`. The static `legacyMethodNames` / `legacyDayCountNames` maps are only a fallback for when the master table is empty
+- **Master data cache** — `validator.LoadMasterData()` caches for 30s. Every reference CUD handler calls `validator.InvalidateMasterData()`, so a code added in the admin panel is accepted by the very next upload. Forgetting that call means a 30s window where new codes are still rejected
+- **An empty master table skips validation for its column** rather than rejecting every row — a superadmin who wipes a table must not be able to lock out all uploads
+- **Deleting a master data code is blocked while `loan_inputs` still uses it** (`refUsageColumns` in `handlers/reference.go`, HTTP 409). Renaming is always allowed
+- **`TrimLeadingSpace` must be off for tab-delimited files** — Go's csv reader counts a tab as leading whitespace, so `a\t\tb` reads as two fields and every row with a blank cell fails the field-count check
+- **Do not add a column check to `csv.go` or `xlsx.go`** — both delegate to `validator.validateRow`. Declare the column in `validator.InputColumns` and the guide, the template and both parsers pick it up
 - **Indonesian number format** — validator handles `1.000.000,50` → `1000000.50`
 - **Scenario overlap validator** — mirrors `installment_software/validator.py`. Deduplicates on the distinct key **before** comparing pairwise, checks within the Bucket section and within the Cashflow section, and does **not** check across them. Also detects exact duplicate rows (Step 0). Only `"All"` acts as wildcard — empty string does NOT
 - **30/360 year fraction** — counts *whole* months via `fullMonthsBetween`, matching `dateutil.relativedelta`. A plain calendar-month subtraction overstates the period whenever the end day-of-month precedes the start's (2025-12-31 → 2026-06-01 is 5 months, not 6), and a naive day-of-month test breaks on end-of-month clamping (2025-01-31 → 2026-02-28 *is* a full 13 months)

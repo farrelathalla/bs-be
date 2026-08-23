@@ -97,6 +97,18 @@ func SeedReferenceData() {
 			{"6", "Semi-Annual"},
 			{"12", "Annual"},
 		},
+		"insured_types": {
+			{"1", "Insured"},
+			{"2", "Uninsured"},
+		},
+		"asset_liabilities": {
+			{"1", "Asset"},
+			{"2", "Liability"},
+		},
+		"revolving_flags": {
+			{"1", "Revolving"},
+			{"2", "Non Revolving"},
+		},
 	}
 
 	for table, items := range refs {

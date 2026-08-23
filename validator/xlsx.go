@@ -14,7 +14,16 @@ import (
 
 // ValidateAndParseXLSX validates an XLSX file and returns parsed loans or validation errors.
 // Interest rates in XLSX are expected as decimals (0.09 = 9%), NOT percentages.
+// Every coded column is checked against the master data tables.
 func ValidateAndParseXLSX(content []byte, maxErrors int) ([]models.Loan, []models.ValidationError) {
+	return ValidateAndParseXLSXEx(content, maxErrors, LoadMasterData())
+}
+
+// ValidateAndParseXLSXEx lets the caller supply the master data snapshot.
+func ValidateAndParseXLSXEx(content []byte, maxErrors int, md *MasterData) ([]models.Loan, []models.ValidationError) {
+	if md == nil {
+		md = LoadMasterData()
+	}
 	var errors []models.ValidationError
 	var loans []models.Loan
 
@@ -55,15 +64,7 @@ func ValidateAndParseXLSX(content []byte, maxErrors int) ([]models.Loan, []model
 	}
 
 	// Check required columns
-	for _, reqCol := range RequiredColumns {
-		if _, ok := colIndex[reqCol]; !ok {
-			errors = append(errors, models.ValidationError{
-				Row:    1,
-				Column: reqCol,
-				Message: fmt.Sprintf("Missing required column: '%s'", reqCol),
-			})
-		}
-	}
+	errors = append(errors, checkRequiredHeaders(colIndex)...)
 
 	if len(errors) > 0 {
 		return nil, errors
@@ -119,214 +120,17 @@ func ValidateAndParseXLSX(content []byte, maxErrors int) ([]models.Loan, []model
 			return time.Time{}, fmt.Errorf("cannot parse date: %s", rawVal)
 		}
 
-		// Parse Reporting Date
-		reportingDate, err := getCellDate("Reporting Date")
-		if err != nil {
-			errors = append(errors, models.ValidationError{
-				Row: rowNum, Column: "Reporting Date",
-				Message: fmt.Sprintf("Invalid date: %v", err),
-			})
-		}
-
-		// Account ID
-		accountID := getField("Account ID")
-		if accountID == "" {
-			errors = append(errors, models.ValidationError{
-				Row: rowNum, Column: "Account ID",
-				Message: "Account ID cannot be empty",
-			})
-		}
-
-		// CCY
-		ccy := getField("CCY")
-
-		// Outstanding
-		outstanding, err := parseNumber(getField("Outstanding"))
-		if err != nil {
-			errors = append(errors, models.ValidationError{
-				Row: rowNum, Column: "Outstanding",
-				Message: fmt.Sprintf("'%s' is not a valid number", getField("Outstanding")),
-			})
-		}
-
-		// Interest Rate — XLSX stores as decimal, no /100 conversion
-		interestRate, err := parseNumber(getField("Interest Rate"))
-		if err != nil {
-			errors = append(errors, models.ValidationError{
-				Row: rowNum, Column: "Interest Rate",
-				Message: fmt.Sprintf("'%s' is not a valid number", getField("Interest Rate")),
-			})
-		}
-		// No /100 — XLSX already stores as decimal
-
-		// Start Date (optional)
-		var startDate time.Time
-		startDateStr := getField("Start Date")
-		if startDateStr != "" {
-			sd, err := getCellDate("Start Date")
-			if err != nil {
-				errors = append(errors, models.ValidationError{
-					Row: rowNum, Column: "Start Date",
-					Message: fmt.Sprintf("Invalid date: %v", err),
-				})
-			} else {
-				startDate = sd
+		loan, rowErrors := validateRow(getField, getCellDate, md, rowNum, true)
+		if len(rowErrors) > 0 {
+			errors = append(errors, rowErrors...)
+			if len(errors) >= maxErrors {
+				errors = errors[:maxErrors]
+				break
 			}
-		}
-
-		// End Date (NULLABLE)
-		var endDate *time.Time
-		endDateStr := getField("End Date")
-		if endDateStr != "" && strings.ToUpper(endDateStr) != "NULL" && strings.ToUpper(endDateStr) != "NA" && strings.ToUpper(endDateStr) != "N/A" {
-			ed, err := getCellDate("End Date")
-			if err != nil {
-				errors = append(errors, models.ValidationError{
-					Row: rowNum, Column: "End Date",
-					Message: fmt.Sprintf("Invalid date: %v", err),
-				})
-			} else {
-				endDate = &ed
-			}
-		}
-
-		// Installment Frequency (nullable)
-		var installmentFreq *int
-		instFreqStr := getField("Installment Frequency")
-		if instFreqStr != "" && strings.ToUpper(instFreqStr) != "NULL" && strings.ToUpper(instFreqStr) != "NA" {
-			fv, ferr := strconv.ParseFloat(instFreqStr, 64)
-			if ferr == nil {
-				iv := int(fv)
-				installmentFreq = &iv
-			}
-		}
-
-		// Interest Payment Frequency (nullable)
-		var interestPaymentFreq *int
-		intFreqStr := getField("Interest Payment Frequency")
-		if intFreqStr != "" && strings.ToUpper(intFreqStr) != "NULL" && strings.ToUpper(intFreqStr) != "NONE" {
-			fv, ferr := strconv.ParseFloat(intFreqStr, 64)
-			if ferr == nil {
-				iv := int(fv)
-				interestPaymentFreq = &iv
-			}
-		}
-
-		// Method — accepts ID (1=annuity, 2=flat) or string
-		methodStr := strings.TrimSpace(getField("Method"))
-		if methodStr == "" {
-			methodStr = "annuity"
-		} else {
-			// Handle float from Excel (e.g. "1.0" → "1")
-			if fv, err := strconv.ParseFloat(methodStr, 64); err == nil {
-				methodStr = strconv.Itoa(int(fv))
-			}
-			if mapped, ok := methodIDMap[methodStr]; ok {
-				methodStr = mapped
-			} else {
-				methodStr = strings.ToLower(methodStr)
-			}
-		}
-		if methodStr != "annuity" && methodStr != "flat" {
-			errors = append(errors, models.ValidationError{
-				Row: rowNum, Column: "Method",
-				Message: fmt.Sprintf("'%s' is not valid, expected 1 (Annuity), 2 (Flat), 'annuity', or 'flat'", getField("Method")),
-			})
-		}
-
-		// Day Count
-		dayCount := strings.TrimSpace(getField("Day Count"))
-		if dayCount == "" {
-			dayCount = "30/360"
-		} else {
-			// Handle float from Excel (e.g. "1.0" → "1")
-			if fv, err := strconv.ParseFloat(dayCount, 64); err == nil {
-				dayCount = strconv.Itoa(int(fv))
-			}
-			if mapped, ok := dayCountIDMap[dayCount]; ok {
-				dayCount = mapped
-			}
-		}
-		validDayCounts := map[string]bool{"30/360": true, "ACT/365": true, "ACT/360": true}
-		if !validDayCounts[dayCount] {
-			errors = append(errors, models.ValidationError{
-				Row: rowNum, Column: "Day Count",
-				Message: fmt.Sprintf("'%s' is not valid", getField("Day Count")),
-			})
-		}
-
-		// Default Behaviour
-		defaultBehaviour := true
-		dbStr := strings.ToUpper(getField("Default Behaviour"))
-		if dbStr == "FALSE" || dbStr == "0" || dbStr == "NO" {
-			defaultBehaviour = false
-		}
-
-		// Instrument Type
-		instrumentType := getField("Instrument Type")
-		// Normalize float from Excel (e.g. "1.0" → "1")
-		if fv, err := strconv.ParseFloat(instrumentType, 64); err == nil {
-			instrumentType = strconv.Itoa(int(fv))
-		}
-
-		// Market Value
-		marketValue, _ := parseNumber(getField("Market Value"))
-
-		// Account Number
-		accountNumber := getField("Account Number")
-
-		// Asset_Liability (default 1)
-		assetLiability := 1
-		alStr := getField("Asset_Liability")
-		if alStr != "" && strings.ToUpper(alStr) != "NULL" {
-			alVal, alErr := strconv.ParseFloat(alStr, 64)
-			if alErr == nil {
-				assetLiability = int(alVal)
-			}
-			if assetLiability != 1 && assetLiability != 2 {
-				assetLiability = 1
-			}
-		}
-
-		// Margin
-		margin, _ := parseNumber(getField("Margin"))
-
-		// Revolving_flag
-		revolvingFlag := getField("Revolving_flag")
-
-		if len(errors) > maxErrors {
-			errors = errors[:maxErrors]
-			break
-		}
-		if len(errors) > 0 {
 			continue
 		}
 
-		loans = append(loans, models.Loan{
-			ReportingDate:            reportingDate,
-			AccountID:                accountID,
-			AccountNumber:            accountNumber,
-			CCY:                      ccy,
-			Outstanding:              outstanding,
-			InterestRate:             interestRate,
-			StartDate:                startDate,
-			EndDate:                  endDate,
-			InstallmentFrequency:     installmentFreq,
-			ProductType:              getField("ProductType"),
-			Segment:                  getField("Segment"),
-			Daerah:                   getField("Daerah"),
-			KodePos:                  getField("KodePos"),
-			InsuredOrUninsured:       getField("Insured/Uninsured"),
-			TransactionalOrNon:       getField("Transactional/Non Transactional"),
-			Method:                   methodStr,
-			InterestPaymentFrequency: interestPaymentFreq,
-			DayCount:                 dayCount,
-			DefaultBehaviour:         defaultBehaviour,
-			InstrumentType:           instrumentType,
-			MarketValue:              marketValue,
-			AssetLiability:           assetLiability,
-			Margin:                   margin,
-			RevolvingFlag:            revolvingFlag,
-		})
+		loans = append(loans, *loan)
 	}
 
 	if len(errors) > 0 {

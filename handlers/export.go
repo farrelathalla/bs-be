@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 	"time"
 
 	"bs-be/calculator"
 	"bs-be/config"
+	"bs-be/validator"
 
 	"github.com/gin-gonic/gin"
 	"github.com/xuri/excelize/v2"
@@ -26,15 +28,15 @@ func ExportExcel(c *gin.Context) {
 	json.Unmarshal([]byte(filtersJSON), &filters)
 
 	filterColMap := map[string]string{
-		"ccy":                    "li.ccy",
-		"segment":                "li.segment",
-		"product_type":           "li.product_type",
-		"daerah":                 "li.daerah",
-		"method":                 "li.method",
-		"insured_or_uninsured":   "li.insured_or_uninsured",
-		"transactional_or_non":   "li.transactional_or_non",
-		"kode_pos":               "li.kode_pos",
-		"account_id":             "li.account_id",
+		"ccy":                  "li.ccy",
+		"segment":              "li.segment",
+		"product_type":         "li.product_type",
+		"daerah":               "li.daerah",
+		"method":               "li.method",
+		"insured_or_uninsured": "li.insured_or_uninsured",
+		"transactional_or_non": "li.transactional_or_non",
+		"kode_pos":             "li.kode_pos",
+		"account_id":           "li.account_id",
 	}
 
 	whereClause := "li.upload_id = $1"
@@ -125,6 +127,10 @@ func ExportExcel(c *gin.Context) {
 		f.SetCellStyle(sheet, "A1", endCol, headerStyle)
 	}
 
+	// Coded columns are exported with their master data name, so the file
+	// reads the same way the on-screen table does.
+	md := validator.LoadMasterData()
+
 	rowIdx := 2
 	for rows.Next() {
 		var rowNum, remainingDays int
@@ -187,29 +193,29 @@ func ExportExcel(c *gin.Context) {
 		setCell(rowNum)
 		setCell(reportingDate.Format("02/01/2006"))
 		setCell(accountID)
-		setCell(ccy)
+		setCell(md.Name("currencies", ccy))
 		setCell(outstanding)
 		setCell(interestRate)
 		setCell(startDate.Format("02/01/2006"))
 		setCell(endDate.Format("02/01/2006"))
 		if installmentFreq.Valid {
-			setCell(int(installmentFreq.Int64))
+			setCell(md.Name("installment_frequencies", strconv.FormatInt(installmentFreq.Int64, 10)))
 		} else {
 			setCell("")
 		}
-		setCell(productType)
-		setCell(segment)
+		setCell(md.Name("product_types", productType))
+		setCell(md.Name("segments", segment))
 		setCell(daerah)
 		setCell(kodePos)
-		setCell(insured)
-		setCell(transactional)
-		setCell(method)
+		setCell(md.Name("insured_types", insured))
+		setCell(md.Name("transactional_types", transactional))
+		setCell(md.Name("methods", method))
 		if interestPaymentFreq.Valid {
-			setCell(int(interestPaymentFreq.Int64))
+			setCell(md.Name("installment_frequencies", strconv.FormatInt(interestPaymentFreq.Int64, 10)))
 		} else {
 			setCell("")
 		}
-		setCell(dayCount)
+		setCell(md.Name("day_counts", dayCount))
 		setCell(remainingDays)
 
 		for _, l := range calculator.LCRLabels {

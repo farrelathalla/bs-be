@@ -6,26 +6,30 @@ import (
 
 	"bs-be/config"
 	"bs-be/models"
+	"bs-be/validator"
 
 	"github.com/gin-gonic/gin"
 )
 
-// validRefTables whitelist of allowed reference table names
-var validRefTables = map[string]bool{
-	"product_types":          true,
-	"segments":               true,
-	"methods":                true,
-	"day_counts":             true,
-	"currencies":             true,
-	"instrument_types":       true,
-	"transactional_types":    true,
-	"installment_frequencies": true,
+// validRefTables and allRefTableNames are derived from validator.MasterTables,
+// the single catalog of reference ("master data") tables.
+var validRefTables = buildValidRefTables()
+var allRefTableNames = buildRefTableNames()
+
+func buildValidRefTables() map[string]bool {
+	m := make(map[string]bool, len(validator.MasterTables))
+	for _, t := range validator.MasterTables {
+		m[t.Key] = true
+	}
+	return m
 }
 
-// allRefTableNames is the ordered list for GetAllReferenceMaps
-var allRefTableNames = []string{
-	"product_types", "segments", "methods", "day_counts",
-	"currencies", "instrument_types", "transactional_types", "installment_frequencies",
+func buildRefTableNames() []string {
+	out := make([]string, 0, len(validator.MasterTables))
+	for _, t := range validator.MasterTables {
+		out = append(out, t.Key)
+	}
+	return out
 }
 
 // GetAllReferenceMaps returns all reference tables as a single JSON object
@@ -35,7 +39,7 @@ func GetAllReferenceMaps(c *gin.Context) {
 
 	for _, table := range allRefTableNames {
 		rows, err := config.DB.Query(
-			fmt.Sprintf("SELECT id, name FROM %s ORDER BY id", table),
+			fmt.Sprintf("SELECT id, name FROM %s ORDER BY LENGTH(id), id", table),
 		)
 		if err != nil {
 			result[table] = []models.ReferenceItem{}
@@ -60,12 +64,12 @@ func GetAllReferenceMaps(c *gin.Context) {
 func ListReference(c *gin.Context) {
 	table := c.Param("table")
 	if !validRefTables[table] {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid reference table"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Unknown master data table '" + table + "'"})
 		return
 	}
 
 	rows, err := config.DB.Query(
-		fmt.Sprintf("SELECT id, name FROM %s ORDER BY id", table),
+		fmt.Sprintf("SELECT id, name FROM %s ORDER BY LENGTH(id), id", table),
 	)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to query: " + err.Error()})
@@ -88,7 +92,7 @@ func ListReference(c *gin.Context) {
 func CreateReference(c *gin.Context) {
 	table := c.Param("table")
 	if !validRefTables[table] {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid reference table"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Unknown master data table '" + table + "'"})
 		return
 	}
 
@@ -112,6 +116,7 @@ func CreateReference(c *gin.Context) {
 		return
 	}
 
+	validator.InvalidateMasterData()
 	c.JSON(http.StatusCreated, item)
 }
 
@@ -120,7 +125,7 @@ func UpdateReference(c *gin.Context) {
 	table := c.Param("table")
 	id := c.Param("id")
 	if !validRefTables[table] {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid reference table"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Unknown master data table '" + table + "'"})
 		return
 	}
 
@@ -151,7 +156,40 @@ func UpdateReference(c *gin.Context) {
 	}
 
 	item.ID = id
+	validator.InvalidateMasterData()
 	c.JSON(http.StatusOK, item)
+}
+
+// refUsageColumns maps a master data table to the loan_inputs column that
+// stores its codes, so a value still present in uploaded data cannot be
+// deleted out from under it.
+var refUsageColumns = map[string]string{
+	"product_types":           "product_type",
+	"segments":                "segment",
+	"methods":                 "method",
+	"day_counts":              "day_count",
+	"currencies":              "ccy",
+	"instrument_types":        "instrument_type",
+	"transactional_types":     "transactional_or_non",
+	"insured_types":           "insured_or_uninsured",
+	"revolving_flags":         "revolving_flag",
+	"installment_frequencies": "installment_frequency",
+}
+
+// countReferenceUsage returns how many uploaded rows still use a code.
+func countReferenceUsage(table, id string) int {
+	column, ok := refUsageColumns[table]
+	if !ok {
+		return 0
+	}
+	var count int
+	err := config.DB.QueryRow(
+		fmt.Sprintf("SELECT COUNT(*) FROM loan_inputs WHERE %s::text = $1", column), id,
+	).Scan(&count)
+	if err != nil {
+		return 0
+	}
+	return count
 }
 
 // DeleteReference removes an item from a reference table
@@ -159,7 +197,15 @@ func DeleteReference(c *gin.Context) {
 	table := c.Param("table")
 	id := c.Param("id")
 	if !validRefTables[table] {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid reference table"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Unknown master data table '" + table + "'"})
+		return
+	}
+
+	if used := countReferenceUsage(table, id); used > 0 {
+		c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf(
+			"'%s' is still used by %d uploaded row(s). Delete or re-upload those files first, or rename this entry instead of deleting it.",
+			id, used,
+		)})
 		return
 	}
 
@@ -178,5 +224,6 @@ func DeleteReference(c *gin.Context) {
 		return
 	}
 
+	validator.InvalidateMasterData()
 	c.JSON(http.StatusOK, gin.H{"message": "Deleted successfully"})
 }
